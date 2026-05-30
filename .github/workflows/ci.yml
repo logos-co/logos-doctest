@@ -51,3 +51,157 @@ jobs:
           nix run .# -- run examples/hello.test.yaml \
             --report /tmp/report.html --continue-on-fail
           test -s /tmp/report.html
+
+      # Resolve the commit under test so the self-documenting `doctests/` suite
+      # exercises THIS code on both sides of the inception: the outer runner is
+      # this checkout (nix run .#), and --release-for pins the inner
+      # `github:logos-co/logos-doctest{release}` calls to the same commit. Fork
+      # PRs blank the sha (their head commit isn't fetchable from logos-co), so
+      # the inner runs fall back to latest.
+      - name: Resolve commit under test
+        id: commit
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && \
+             [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "Fork PR — inner doctest runs will use latest."
+          else
+            echo "sha=${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The doctests/ specs document doctest by driving doctest. Run them all
+      # into one combined report (dropdown per spec). The outer runner is this
+      # checkout; the inner runs use the commit pinned above.
+      - name: Run the self-documenting doctests suite
+        run: |
+          mkdir -p "${{ runner.temp }}/reports"
+          # Name it index.html so the published directory URL renders directly.
+          nix run .# -- run doctests/*.test.yaml \
+            --verbose \
+            --continue-on-fail \
+            --release-for "logos-doctest=${{ steps.commit.outputs.sha }}" \
+            --report "${{ runner.temp }}/reports/index.html"
+
+      - name: Verify the doctests suite renders to Markdown
+        run: |
+          for spec in doctests/*.test.yaml; do
+            name="$(basename "${spec%.test.yaml}")"
+            nix run .# -- generate "$spec" -o "/tmp/${name}.md"
+            test -s "/tmp/${name}.md"
+            echo "Generated /tmp/${name}.md ($(wc -l < /tmp/${name}.md) lines)"
+          done
+
+      - name: Upload doctests report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: doctests-report-${{ matrix.os }}
+          path: ${{ runner.temp }}/reports/
+          if-no-files-found: warn
+
+  publish-report:
+    name: Publish reports to GitHub Pages
+    needs: test
+    # Run even when tests fail — a failing run is exactly when you want to open
+    # the report. Skip on forks, where GITHUB_TOKEN can't push or comment.
+    if: ${{ always() && github.event.pull_request.head.repo.fork != true }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write          # push to the gh-pages branch
+      pull-requests: write      # post/update the PR comment
+
+    # Serialize Pages pushes so two refs can't race on the gh-pages branch.
+    concurrency:
+      group: gh-pages-publish
+      cancel-in-progress: false
+
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          # No `name:` → downloads every artifact into artifacts/<name>/...
+
+      - name: Arrange site directory
+        id: arrange
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="pr-${{ github.event.pull_request.number }}"
+          else
+            BASE="main"
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+          mkdir -p "site/$BASE"
+          found=""
+          for os in ubuntu-latest macos-latest; do
+            src="artifacts/doctests-report-$os"
+            # Each OS produces a single combined report (index.html) whose
+            # built-in dropdown switches between specs — publish it as-is.
+            if [ -f "$src/index.html" ]; then
+              mkdir -p "site/$BASE/$os"
+              cp "$src/index.html" "site/$BASE/$os/index.html"
+              found="$found $os"
+            fi
+          done
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+
+          # Top-level landing page for this ref linking to each OS.
+          {
+            echo "<!doctype html><meta charset=utf-8>"
+            echo "<title>doctest self-test reports — $BASE</title>"
+            echo "<style>body{font:16px system-ui;margin:40px;max-width:640px}a{color:#2563eb}</style>"
+            echo "<h1>doctest self-test reports</h1>"
+            echo "<p><strong>$BASE</strong> · commit <code>${GITHUB_SHA::7}</code></p><ul>"
+            for os in ubuntu-latest macos-latest; do
+              if [ -d "site/$BASE/$os" ]; then
+                echo "<li><a href=\"./$os/\">$os</a></li>"
+              fi
+            done
+            echo "</ul>"
+          } > "site/$BASE/index.html"
+
+      - name: Deploy to gh-pages
+        if: steps.arrange.outputs.found != ''
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          keep_files: true          # don't wipe other PRs' directories
+          commit_message: "Publish doctest self-test reports for ${{ steps.arrange.outputs.base }} (${{ github.sha }})"
+
+      - name: Comment on PR with report links
+        if: ${{ github.event_name == 'pull_request' && steps.arrange.outputs.found != '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const base = "${{ steps.arrange.outputs.base }}";
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const root = `https://${owner}.github.io/${repo}/${base}`;
+            const oses = "${{ steps.arrange.outputs.found }}".trim().split(/\s+/).filter(Boolean);
+
+            const links = oses.map(os => `- [\`${os}\` report](${root}/${os}/)`).join("\n");
+            const marker = "<!-- doctest-selftest-report-links -->";
+            const body =
+              `${marker}\n` +
+              `### 📊 doctest self-test reports\n\n` +
+              `The self-documenting \`doctests/\` tutorials, rendered alongside the ` +
+              `commands actually run and their output ` +
+              `(updated each run, commit \`${context.sha.slice(0,7)}\`):\n\n` +
+              `${links}\n\n` +
+              `_Pages can take a minute to update after the run finishes._`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: context.issue.number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: context.issue.number, body });
+            }

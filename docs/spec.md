@@ -26,7 +26,7 @@ prerequisites:
 
 sections:
   - title: "Set Up the Project"
-    phase: scaffold
+    step: true
     text: |
       Intro paragraph for this section.
     steps:
@@ -317,7 +317,27 @@ These placeholders are expanded at execution time by the runner and at generatio
 | `{ext}` | `so` | `dylib` |
 | `{shared_flags}` | `-shared -fPIC` | `-dynamiclib` |
 
-Platform placeholders work in `run`, `check_file`, `extra_run.run`, and `file.content` fields. They are **not** expanded in `code_block`, `text`, or `post_text` — those are rendered verbatim.
+Placeholders are expanded in the fields that carry **commands and content**:
+`run`, `check_file`, `file.content`, `code_block`, `text`, `post_text`, and the
+`extra_run.*` equivalents. The runner expands them before executing a command;
+the generator expands them before writing the Markdown, so what readers see
+matches what ran.
+
+They are **not** expanded in the framing fields: `name`, `intro`,
+`what_you_build`, `what_you_learn`, `prerequisites`, and section/step `title`.
+Prose there that needs to *name* a placeholder literally (for example a tutorial
+about placeholders) can safely write `{release}` in those fields and it renders
+verbatim.
+
+There is no escape sequence. If you must show a literal placeholder inside an
+*expanded* field — or write one into a nested spec via a `file`/heredoc — keep it
+out of the engine's reach, e.g. assemble the braces in the shell at run time:
+
+```yaml
+run: |
+  LB='{'; RB='}'
+  echo "github:logos-co/repo${LB}release${RB}#x"   # writes a literal {release}
+```
 
 When a command uses platform placeholders, provide a `code_block` showing both platform variants for the markdown.
 
@@ -532,8 +552,8 @@ Pair `--report` with `--continue-on-fail` so the report captures the full run ra
 
 - Walks the same YAML structure
 - Produces markdown with proper headings, code blocks, and prose
-- Sections with `phase` get numbered as "Step 1:", "Step 2:", etc.
-- Sections without `phase` get plain `## Title` headings
+- Sections with `step: true` get numbered as "Step 1:", "Step 2:", etc.
+- Sections without `step` get plain `## Title` headings
 - `expect_contains` and `check_file` are not rendered (runner-only)
 - `code_block` overrides the `run` value for display
 - `file` content is rendered as a fenced code block with syntax highlighting
