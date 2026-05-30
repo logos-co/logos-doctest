@@ -64,6 +64,7 @@ flags:
 | `--report PATH`         | Write a self-contained two-column HTML report (rendered docs ⟷ commands run and their output).                                                                                     |
 | `--tui` / `--iterative` | Live two-column terminal view; `--iterative` advances one step per keypress. Needs `rich`.                                                                                         |
 | `--release TAG`         | Pin every `{release}` placeholder in GitHub URLs to a git tag.                                                                                                                     |
+| `--release-for REPO=REF`| Pin one repo's `{release}` to a git tag or commit hash (repeatable; overrides `--release` for that repo).                                                                          |
 | `--continue-on-fail`    | Don't stop at the first failing step (capture the whole run).                                                                                                                      |
 | `--verbose`             | Echo each command and its full output as it runs.                                                                                                                                  |
 
@@ -146,6 +147,38 @@ placeholder in GitHub URLs to a git tag, so `github:logos-co/repo{release}#outpu
 becomes `github:logos-co/repo/<TAG>#output`. Set it to `""` or omit it for the
 latest. This lets one spec render either bleeding-edge or pinned-to-a-release
 instructions without editing the URLs by hand.
+
+### Pinning a single repo (`--release-for`)
+
+`--release-for REPO=REF` overrides the `{release}` ref for **one** GitHub repo,
+where `REF` is a git tag **or a commit hash**. It's repeatable and wins over
+`--release` (and the spec's `release:`) for that repo only; every other URL still
+uses the global release. An empty ref (`--release-for REPO=`) forces that repo to
+latest even when a global release is set.
+
+```bash
+# Everything from tutorial-v2, but build logos-logoscore-cli at a specific commit
+doctest run spec.yaml --release tutorial-v2 \
+  --release-for logos-logoscore-cli=abc123def
+
+# Pin two repos to different refs, no global release
+doctest run spec.yaml \
+  --release-for logos-logoscore-cli=abc123def \
+  --release-for logos-basecamp=my-branch
+```
+
+The canonical use case is CI: when testing a single repo's PR against the rest of
+the released stack, pass `--release-for <that-repo>=$GITHUB_SHA` so the spec
+builds the commit under test while every other URL stays pinned to the release.
+
+Per-repo pins can also live in the spec under `release_overrides:` (a
+`{repo: ref}` map); CLI `--release-for` flags override the spec on conflicts:
+
+```yaml
+release: tutorial-v2
+release_overrides:
+  logos-logoscore-cli: abc123def
+```
 
 ## Cleaning an output tree (`clean`)
 

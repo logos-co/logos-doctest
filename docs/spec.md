@@ -61,6 +61,7 @@ sections:
 | `comparison` | no | string | Free-form markdown block rendered after the learning objectives (useful for comparison tables). |
 | `prerequisites` | no | list of strings | Rendered as a bullet list under a prerequisites heading. Each item can contain markdown (code blocks, links, etc.). |
 | `release` | no | string | Git tag applied to all `{release}` placeholders in GitHub URLs (e.g., `tutorial-v2`). See [Release tags](#release-tags). |
+| `release_overrides` | no | map | Per-repo `{release}` pins: keys are GitHub repo names (e.g., `logos-logoscore-cli`), values are a git tag **or commit hash**. Overrides `release` for those repos only. See [Per-repo release pins](#per-repo-release-pins). |
 | `build_overrides` | no | map | Nix `--override-input` flags for the runner. Keys are input names, values are relative paths to local repos. Only affects execution, not generation. |
 | `sections` | yes | list | The tutorial content. See below. |
 
@@ -360,6 +361,71 @@ python3 tools/tutorial_runner.py generate spec.yaml --release tutorial-v2
 # Clear the tag even if the YAML sets one
 python3 tools/tutorial_runner.py run spec.yaml --release ""
 ```
+
+## Per-repo release pins
+
+`release` (and `--release`) pin **every** `{release}` placeholder to the same
+ref. Sometimes you want one repo pinned differently from the rest — most often to
+test a single repo at a specific commit while everything else stays on a release.
+`release_overrides` (YAML) and `--release-for` (CLI) do exactly that.
+
+Each override maps a **GitHub repo name** to a **git tag or commit hash**. A
+`{release}` that immediately follows `github:<owner>/<repo>` resolves to that
+repo's override if one exists, otherwise it falls back to the global `release`
+tag. Any `{release}` not attached to a known GitHub URL still uses the global tag.
+
+```yaml
+release: "tutorial-v2"
+release_overrides:
+  logos-logoscore-cli: "abc123def"   # tag OR commit hash
+```
+
+With the spec above, the same templated URL renders differently per repo:
+
+```bash
+# logos-logoscore-cli uses its override (a commit hash here)…
+nix build 'github:logos-co/logos-logoscore-cli/abc123def' --out-link ./logos
+# …while every other repo still uses the global release tag:
+nix build 'github:logos-co/logos-module/tutorial-v2#lm' --out-link ./lm
+```
+
+The `--release-for REPO=REF` CLI flag does the same thing and **overrides the
+YAML** on conflicts. It is repeatable, so you can pin several repos at once:
+
+```bash
+# Pin one repo to a commit, on top of a global release tag
+python3 tools/tutorial_runner.py run spec.yaml \
+  --release tutorial-v2 \
+  --release-for logos-logoscore-cli=abc123def
+
+# Pin two repos to different refs (tag and branch), no global release
+python3 tools/tutorial_runner.py run spec.yaml \
+  --release-for logos-logoscore-cli=abc123def \
+  --release-for logos-basecamp=my-branch
+
+# An empty ref forces that repo to latest even when a global release is set
+python3 tools/tutorial_runner.py run spec.yaml \
+  --release tutorial-v2 --release-for logos-logoscore-cli=
+```
+
+`--release-for` works on `generate` too, and an active set of pins is printed as a
+`pins :` line at the top of each run.
+
+**Canonical use case — CI testing a single repo's commit.** When a repo's CI runs
+its own doc-test, the spec normally builds `github:logos-co/<repo>{release}`,
+which resolves to **latest master**, not the commit under test. Passing
+`--release-for <repo>=$GITHUB_SHA` makes the doc-test build that exact commit
+while every other URL stays on the release:
+
+```bash
+# In the repo's CI workflow (commit under test in $SHA):
+nix run github:logos-co/logos-doctest -- run doctests/<repo>.test.yaml \
+  --release-for <repo>=$SHA
+```
+
+(Fork PRs are the exception: their head commit lives in the fork, not in the base
+GitHub repo, so `github:<owner>/<repo>/<fork-sha>` can't be fetched. Pass an empty
+ref for forks — `--release-for <repo>=` — to fall back to latest.)
 
 ## Runner behavior
 

@@ -52,6 +52,7 @@ import base64
 import glob
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -221,21 +222,75 @@ def _rec_ui(step, launch_cmd, tests, status, note, output):
 
 RELEASE_TAG = ""
 
+# Per-repo ref overrides: {"logos-logoscore-cli": "abc123", ...}. A {release}
+# placeholder following a github:<owner>/<repo> URL is pinned to that repo's ref
+# (tag OR commit hash) instead of the global RELEASE_TAG. Lets a single spec pin
+# most URLs to a release while testing one repo at a specific commit — e.g. on CI,
+# build the repo under test at the PR's HEAD while everything else stays released.
+RELEASE_OVERRIDES = {}
+
+# Matches a github flake URL immediately followed by {release}, capturing the repo
+# name so expand_vars can look it up in RELEASE_OVERRIDES. Owner is any non-slash
+# run; repo is the segment right before {release} (nix flake repos have no slashes).
+_GITHUB_RELEASE_RE = re.compile(r"(github:[^/\s]+/([^/\s{]+))\{release\}")
+
 # Directory where ui_test screenshots are written. Set by cmd_run when an output
 # directory is known so captures land beside the generated .md (output_dir/images);
 # left None for ephemeral temp runs, where handle_ui_test falls back to workdir.
 _IMAGES_DIR = None
 
 
-def set_release(tag):
-    global RELEASE_TAG
+def set_release(tag, overrides=None):
+    global RELEASE_TAG, RELEASE_OVERRIDES
     RELEASE_TAG = f"/{tag}" if tag else ""
+    RELEASE_OVERRIDES = dict(overrides or {})
+
+
+def _release_ref_for(repo):
+    """Return the '/<ref>' suffix for a github repo's {release}, honoring overrides."""
+    if repo in RELEASE_OVERRIDES:
+        ref = RELEASE_OVERRIDES[repo]
+        return f"/{ref}" if ref else ""
+    return RELEASE_TAG
+
+
+def parse_release_overrides(cli_values, spec):
+    """Merge per-repo release overrides from the spec and CLI.
+
+    Spec field 'release_overrides' is a {repo: ref} map; CLI --release-for takes
+    'repo=ref' strings (repeatable) and wins over the spec on conflicts. 'ref' is
+    a git tag or commit hash. An empty ref pins that repo to latest even when a
+    global --release is set.
+    """
+    merged = {}
+    spec_overrides = spec.get("release_overrides", {}) or {}
+    for repo, ref in spec_overrides.items():
+        merged[repo] = "" if ref is None else str(ref)
+    for item in (cli_values or []):
+        if "=" not in item:
+            print(f"ERROR: --release-for expects 'repo=ref', got: {item}",
+                  file=sys.stderr)
+            sys.exit(2)
+        repo, ref = item.split("=", 1)
+        repo = repo.strip()
+        if not repo:
+            print(f"ERROR: --release-for is missing a repo name: {item}",
+                  file=sys.stderr)
+            sys.exit(2)
+        merged[repo] = ref.strip()
+    return merged
 
 
 def expand_vars(s):
-    """Replace {ext}, {shared_flags}, and {release} with resolved values."""
+    """Replace {ext}, {shared_flags}, and {release} with resolved values.
+
+    {release} attached to a github:owner/repo URL resolves per-repo (overrides
+    win, else the global release tag); any other {release} uses the global tag.
+    """
     s = s.replace("{ext}", LIB_EXT)
     s = s.replace("{shared_flags}", SHARED_FLAGS)
+    s = _GITHUB_RELEASE_RE.sub(
+        lambda m: m.group(1) + _release_ref_for(m.group(2)), s)
     s = s.replace("{release}", RELEASE_TAG)
     return s
 
@@ -993,7 +1048,9 @@ def run_single_spec(spec, spec_path, workdir, args, results):
     spec_dir = os.path.dirname(spec_path)
 
     release = args.release if args.release is not None else spec.get("release", "")
-    set_release(release)
+    release_overrides = parse_release_overrides(
+        getattr(args, "release_for", None), spec)
+    set_release(release, release_overrides)
 
     override_flags = parse_build_overrides(spec, spec_dir)
     module_name = find_module_name(spec)
@@ -1007,6 +1064,10 @@ def run_single_spec(spec, spec_path, workdir, args, results):
     print(f"  workdir  : {workdir}")
     print(f"  platform : {platform.system()} (ext={LIB_EXT})")
     print(f"  release  : {release or '(none)'}")
+    if release_overrides:
+        pins = ", ".join(f"{r}={ref or 'latest'}"
+                         for r, ref in release_overrides.items())
+        print(f"  pins     : {pins}")
     if override_flags:
         print(f"  overrides: {override_flags}")
     print()
@@ -1931,7 +1992,9 @@ def cmd_generate(args):
         spec = yaml.safe_load(f)
 
     release = args.release if args.release is not None else spec.get("release", "")
-    set_release(release)
+    release_overrides = parse_release_overrides(
+        getattr(args, "release_for", None), spec)
+    set_release(release, release_overrides)
 
     # Module name for rendering logoscore example commands. Derived from the
     # spec's metadata.json step (same resolution the runner uses), falling back
@@ -2305,6 +2368,11 @@ def main():
                             help="Don't stop at the first failure (default: stop)")
     run_parser.add_argument("--release", default=None,
                             help="Git tag for GitHub URLs (overrides spec's 'release' field)")
+    run_parser.add_argument("--release-for", action="append", default=None,
+                            metavar="REPO=REF", dest="release_for",
+                            help="Pin one repo's {release} to a git tag or commit "
+                                 "hash, e.g. --release-for logos-logoscore-cli=abc123 "
+                                 "(repeatable; overrides --release for that repo)")
     run_parser.add_argument("--report", default=None, metavar="PATH",
                             help="Write a two-column HTML report (rendered docs + "
                                  "the commands actually run and their output) to PATH")
@@ -2324,6 +2392,11 @@ def main():
                             help="Output file path (default: uses spec's 'output' field)")
     gen_parser.add_argument("--release", default=None,
                             help="Git tag for GitHub URLs (overrides spec's 'release' field)")
+    gen_parser.add_argument("--release-for", action="append", default=None,
+                            metavar="REPO=REF", dest="release_for",
+                            help="Pin one repo's {release} to a git tag or commit "
+                                 "hash, e.g. --release-for logos-logoscore-cli=abc123 "
+                                 "(repeatable; overrides --release for that repo)")
 
     # ── clean ─────────────────────────────────────────────────────────────
     clean_parser = subparsers.add_parser(
