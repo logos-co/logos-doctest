@@ -47,10 +47,21 @@ python3 doctest.py run examples/hello.test.yaml --verbose # direct, if PyYAML is
 ## Commands
 
 ```bash
-doctest run <spec.yaml> [OPTIONS]         # execute a spec, asserting as it goes
+doctest run <spec.yaml>... [OPTIONS]      # execute one or more specs, asserting as it goes
 doctest generate <spec.yaml> [-o out.md]  # render Markdown from a spec
 doctest clean <dir> [OPTIONS]             # strip build artifacts from an output tree
 ```
+
+`run` accepts **multiple specs**: they execute back-to-back into a single
+`--report`, which gets one dropdown entry per spec. This is how a repo with
+several `*.test.yaml` files publishes one combined CI report instead of a
+separate file per spec:
+
+```bash
+doctest run doctests/*.test.yaml --continue-on-fail --report report.html
+```
+
+(`--output-dir` and `--tui` operate on a single spec — pass just one.)
 
 Run `doctest <command> --help` for the full option list. The most useful `run`
 flags:

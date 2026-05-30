@@ -1130,48 +1130,19 @@ def run_single_spec(spec, spec_path, workdir, args, results):
         print()
 
 
-def cmd_run(args):
-    spec_path = os.path.abspath(args.spec)
+def _run_spec_tree(spec_path, args, results, output_dir, cleanups):
+    """Set up the working directory for one top-level spec, run its requires:
+    chain and then itself. Execution records land in the shared _REPORT
+    collector, so several specs run back-to-back end up in one report (one
+    dropdown entry each). The workdir's cleanup callable is appended to
+    `cleanups` as soon as the directory exists — before any step runs — so a
+    StopEarly mid-run (fail-fast) still leaves the directory registered for
+    removal. May raise StopEarly under fail-fast."""
     spec_dir = os.path.dirname(spec_path)
-
     with open(spec_path) as f:
         spec = yaml.safe_load(f)
 
     requires = spec.get("requires", [])
-    fail_fast = not args.continue_on_fail
-    results = Results(fail_fast=fail_fast)
-
-    tui = getattr(args, "tui", False)
-
-    if getattr(args, "iterative", False) and not tui:
-        print("ERROR: --iterative only applies with --tui", file=sys.stderr)
-        sys.exit(2)
-    if tui:
-        try:
-            import rich  # noqa: F401
-        except ImportError:
-            print("ERROR: --tui requires the 'rich' package. Install it with:\n"
-                  "  pip3 install rich", file=sys.stderr)
-            sys.exit(2)
-        if not sys.stdin.isatty() or not sys.stdout.isatty():
-            print("ERROR: --tui requires an interactive terminal (a TTY).",
-                  file=sys.stderr)
-            sys.exit(2)
-
-    global _REPORT, _IMAGES_DIR
-    # The TUI reads per-step execution records from the collector, so it needs
-    # one active even without --report.
-    if getattr(args, "report", None) or tui:
-        _REPORT = ReportCollector()
-
-    output_dir = getattr(args, "output_dir", None)
-
-    # When the caller picks a persistent output directory, write ui_test
-    # screenshots into <output_dir>/images so they sit beside the generated .md
-    # (which references them as images/<file>.png). Temp runs leave this None and
-    # fall back to the workdir.
-    if output_dir:
-        _IMAGES_DIR = os.path.join(os.path.abspath(output_dir), "images")
 
     if output_dir:
         # --output-dir: run into a persistent directory the caller chooses,
@@ -1223,64 +1194,123 @@ def cmd_run(args):
             if target:
                 shutil.rmtree(target, ignore_errors=True)
 
-    try:
-        # Run prerequisite tutorials first, resolved transitively. requires: is
-        # walked depth-first in post-order, so if A requires B and B requires C,
-        # the run order is C, then B, then A. Shared prerequisites run once
-        # (deduped by spec path) and cycles are reported rather than looping.
-        if requires and created_root:
-            ordered = []          # spec paths in dependency order (deepest first)
-            ran = set()           # spec paths already added to `ordered`
-            in_progress = set()   # spec paths on the current DFS stack (cycle guard)
+    # Register cleanup now, before running any step, so a fail-fast StopEarly
+    # mid-spec still gets the working directory cleaned up by the caller.
+    cleanups.append(cleanup)
 
-            def resolve(req_path, referenced_by):
-                req_path = os.path.abspath(req_path)
-                if req_path in ran:
-                    return
-                if req_path in in_progress:
-                    print(f"ERROR: circular requires: detected at {req_path} "
-                          f"(referenced by {referenced_by})", file=sys.stderr)
-                    sys.exit(2)
-                if not os.path.isfile(req_path):
-                    print(f"ERROR: required spec not found: {req_path} "
-                          f"(referenced by {referenced_by})", file=sys.stderr)
-                    sys.exit(2)
+    # Run prerequisite tutorials first, resolved transitively. requires: is
+    # walked depth-first in post-order, so if A requires B and B requires C,
+    # the run order is C, then B, then A. Shared prerequisites run once
+    # (deduped by spec path) and cycles are reported rather than looping.
+    if requires and created_root:
+        ordered = []          # spec paths in dependency order (deepest first)
+        ran = set()           # spec paths already added to `ordered`
+        in_progress = set()   # spec paths on the current DFS stack (cycle guard)
 
-                with open(req_path) as f:
-                    req_spec = yaml.safe_load(f)
+        def resolve(req_path, referenced_by):
+            req_path = os.path.abspath(req_path)
+            if req_path in ran:
+                return
+            if req_path in in_progress:
+                print(f"ERROR: circular requires: detected at {req_path} "
+                      f"(referenced by {referenced_by})", file=sys.stderr)
+                sys.exit(2)
+            if not os.path.isfile(req_path):
+                print(f"ERROR: required spec not found: {req_path} "
+                      f"(referenced by {referenced_by})", file=sys.stderr)
+                sys.exit(2)
 
-                if not req_spec.get("project_name"):
-                    print(f"ERROR: required spec {req_path} has no project_name field",
-                          file=sys.stderr)
-                    sys.exit(2)
+            with open(req_path) as f:
+                req_spec = yaml.safe_load(f)
 
-                in_progress.add(req_path)
-                req_dir = os.path.dirname(req_path)
-                for nested_rel in req_spec.get("requires", []):
-                    resolve(os.path.join(req_dir, nested_rel), req_path)
-                in_progress.discard(req_path)
+            if not req_spec.get("project_name"):
+                print(f"ERROR: required spec {req_path} has no project_name field",
+                      file=sys.stderr)
+                sys.exit(2)
 
-                ran.add(req_path)
-                ordered.append((req_path, req_spec))
+            in_progress.add(req_path)
+            req_dir = os.path.dirname(req_path)
+            for nested_rel in req_spec.get("requires", []):
+                resolve(os.path.join(req_dir, nested_rel), req_path)
+            in_progress.discard(req_path)
 
-            for req_rel in requires:
-                resolve(os.path.join(spec_dir, req_rel), spec_path)
+            ran.add(req_path)
+            ordered.append((req_path, req_spec))
 
-            for req_path, req_spec in ordered:
-                req_workdir = os.path.join(root_dir, req_spec["project_name"])
-                os.makedirs(req_workdir, exist_ok=True)
-                run_single_spec(req_spec, req_path, req_workdir, args, results)
+        for req_rel in requires:
+            resolve(os.path.join(spec_dir, req_rel), spec_path)
 
-        # Run the main tutorial
-        run_single_spec(spec, spec_path, workdir, args, results)
+        for req_path, req_spec in ordered:
+            req_workdir = os.path.join(root_dir, req_spec["project_name"])
+            os.makedirs(req_workdir, exist_ok=True)
+            run_single_spec(req_spec, req_path, req_workdir, args, results)
 
-    except StopEarly:
-        pass
+    # Run the main tutorial
+    run_single_spec(spec, spec_path, workdir, args, results)
 
     if output_dir:
         print(f"  output : {root_dir or workdir}")
     elif args.keep_workdir or args.workdir:
         print(f"  workdir: {root_dir or workdir}")
+
+
+def cmd_run(args):
+    # `run` accepts one or more specs. Multiple specs run back-to-back into the
+    # same report, so a single --report HTML carries all of them (one dropdown
+    # entry each) instead of a separate file per spec.
+    spec_paths = [os.path.abspath(p) for p in args.spec]
+
+    fail_fast = not args.continue_on_fail
+    results = Results(fail_fast=fail_fast)
+
+    tui = getattr(args, "tui", False)
+
+    if getattr(args, "iterative", False) and not tui:
+        print("ERROR: --iterative only applies with --tui", file=sys.stderr)
+        sys.exit(2)
+    if tui:
+        try:
+            import rich  # noqa: F401
+        except ImportError:
+            print("ERROR: --tui requires the 'rich' package. Install it with:\n"
+                  "  pip3 install rich", file=sys.stderr)
+            sys.exit(2)
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            print("ERROR: --tui requires an interactive terminal (a TTY).",
+                  file=sys.stderr)
+            sys.exit(2)
+        if len(spec_paths) > 1:
+            print("ERROR: --tui runs a single spec at a time; pass one spec.",
+                  file=sys.stderr)
+            sys.exit(2)
+
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir and len(spec_paths) > 1:
+        # Standalone specs would all claim output_dir as their workdir and
+        # collide (e.g. on `nix flake init`); a chain root is single-spec too.
+        print("ERROR: --output-dir supports a single spec; run specs separately.",
+              file=sys.stderr)
+        sys.exit(2)
+
+    global _REPORT, _IMAGES_DIR
+    # The TUI reads per-step execution records from the collector, so it needs
+    # one active even without --report.
+    if getattr(args, "report", None) or tui:
+        _REPORT = ReportCollector()
+
+    # When the caller picks a persistent output directory, write ui_test
+    # screenshots into <output_dir>/images so they sit beside the generated .md
+    # (which references them as images/<file>.png). Temp runs leave this None and
+    # fall back to the workdir.
+    if output_dir:
+        _IMAGES_DIR = os.path.join(os.path.abspath(output_dir), "images")
+
+    cleanups = []
+    try:
+        for spec_path in spec_paths:
+            _run_spec_tree(spec_path, args, results, output_dir, cleanups)
+    except StopEarly:
+        pass
 
     ok = results.summary()
 
@@ -1293,10 +1323,11 @@ def cmd_run(args):
         except Exception as e:
             print(f"  {yellow(f'report generation failed: {e}')}")
 
-    try:
-        cleanup()
-    except Exception:
-        pass
+    for cleanup in cleanups:
+        try:
+            cleanup()
+        except Exception:
+            pass
 
     sys.exit(0 if ok else 1)
 
@@ -2347,7 +2378,11 @@ def main():
 
     # ── run ───────────────────────────────────────────────────────────────
     run_parser = subparsers.add_parser("run", help="Execute a doctest spec")
-    run_parser.add_argument("spec", help="Path to the YAML spec file")
+    run_parser.add_argument("spec", nargs="+",
+                            help="Path(s) to YAML spec file(s). Multiple specs "
+                                 "run back-to-back into one --report (each a "
+                                 "dropdown entry). --output-dir and --tui take a "
+                                 "single spec.")
     run_parser.add_argument("--keep-workdir", action="store_true",
                             help="Don't delete the temp working directory on exit")
     run_parser.add_argument("--workdir", default=None,

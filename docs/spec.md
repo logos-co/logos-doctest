@@ -515,7 +515,7 @@ It records every executed action type:
 | `check_file` | the glob checked and which file matched |
 | `ui_test` | the launch command, the list of UI test actions, and the framework output (plus the app log tail on failure) |
 
-When a chain runs (`requires:`), every tutorial in the chain is included; a dropdown at the top switches between them. Markdown is rendered client-side via [marked.js](https://marked.js.org/) loaded from a CDN, so viewing the report needs network access on first open.
+The dropdown at the top of the report switches between specs. It is populated whenever the report holds more than one spec, which happens two ways: a `requires:` chain (every tutorial in the chain is included), or passing **several specs to one `run`** (`doctest run a.test.yaml b.test.yaml --report out.html`). The latter is how a repo with multiple independent `*.test.yaml` files publishes a single combined CI report — one dropdown entry per spec — instead of a separate HTML file each. Markdown is rendered client-side via [marked.js](https://marked.js.org/) loaded from a CDN, so viewing the report needs network access on first open.
 
 Pair `--report` with `--continue-on-fail` so the report captures the full run rather than stopping at the first failure. The CI workflow ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs with `--report` and publishes the result to GitHub Pages, linked from a PR comment.
 
