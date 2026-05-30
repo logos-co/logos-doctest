@@ -1,0 +1,11 @@
+# Nix build artifacts
+result
+result-*
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated output / scratch
+*.md.tmp
+/outputs/

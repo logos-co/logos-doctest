@@ -1,0 +1,59 @@
+name: "Hello, doctest"
+output: hello.md
+
+intro: |
+  A tiny, dependency-free example spec. It writes a file, runs a shell command,
+  asserts on the command's output, and checks that an expected file exists — the
+  generic core of `doctest` with no Nix, Qt, or Logos toolchain required.
+
+  Run it:
+
+  ```bash
+  doctest run examples/hello.test.yaml --verbose
+  ```
+
+  Generate the Markdown version:
+
+  ```bash
+  doctest generate examples/hello.test.yaml -o hello.md
+  ```
+
+what_you_build: "A greeting file, verified by running the spec."
+
+what_you_learn:
+  - How a `file` step writes content to the working directory
+  - How a `run` step executes a command and asserts on its output
+  - How `check_file` verifies an artifact exists
+
+prerequisites:
+  - "**Python 3** with PyYAML (the `doctest` flake provides both)."
+
+sections:
+  - title: "Write a greeting"
+    step: true
+    text: |
+      Create a small text file in the working directory.
+    steps:
+      - title: "Create greeting.txt"
+        text: "Write the greeting:"
+        file:
+          path: greeting.txt
+          language: text
+          content: |
+            Hello, doctest!
+
+  - title: "Run and verify"
+    step: true
+    text: |
+      Read the file back and confirm its contents.
+    steps:
+      - title: "Print the greeting"
+        run: "cat greeting.txt"
+        expect_contains:
+          - "Hello, doctest!"
+        post_text: |
+          The runner captures stdout and checks that every `expect_contains`
+          string is present.
+
+      - title: "Confirm the file exists"
+        check_file: "greeting.txt"
