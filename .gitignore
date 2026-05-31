@@ -9,3 +9,8 @@ __pycache__/
 # Generated output / scratch
 *.md.tmp
 /outputs/
+
+# doctests/ self-test output: keep the rendered tutorials (*.md), ignore the
+# run artifacts (logs, copied modules, out-links, etc.) that run.sh leaves behind.
+doctests/outputs/*
+!doctests/outputs/*.md

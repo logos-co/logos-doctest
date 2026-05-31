@@ -282,8 +282,24 @@ logos-doctest/
 ├── bin/doctest                # nix-shell fallback wrapper
 ├── docs/spec.md               # canonical spec format reference
 ├── examples/hello.test.yaml   # minimal, nix-free example spec
-└── .github/workflows/ci.yml   # self-test: run + generate + report the example
+├── doctests/                  # doctest documenting itself (run by CI)
+│   ├── 01-getting-started.test.yaml        # the run / generate loop
+│   ├── 02-generate-and-report.test.yaml    # code_block, extra_run, --report, --tui
+│   ├── 03-chaining-and-clean.test.yaml     # requires:, --output-dir, --workdir, clean
+│   ├── 04-multispec-and-releases.test.yaml # combined reports, {release}, --release-for
+│   ├── 05-more-spec-features.test.yaml     # encoding:base64, comparison, build_overrides, ui_test
+│   └── run.sh                              # run + generate the suite locally
+└── .github/workflows/ci.yml   # self-test: example + the doctests/ suite
 ```
+
+### Self-documenting tutorials (`doctests/`)
+
+The specs under `doctests/` are an **inception**: `doctest` specs that teach how
+to use `doctest`, executed by `doctest` itself in CI. Each is a step-by-step
+tutorial that writes a smaller inner spec, runs it, and asserts on the result, so
+the tool's own documentation cannot drift from its behaviour. Run the whole suite
+locally with `doctests/run.sh` (or render it with `doctest generate`). They are
+also the most complete worked examples of the features above.
 
 ## License
 
