@@ -133,6 +133,10 @@ It covers every step type (file writes, shell commands, `check_file`, and headle
 `ui_test` runs). Pair it with `--continue-on-fail` so the report captures the whole
 run instead of stopping at the first failure — ideal for publishing from CI.
 
+When a run includes multiple specs, the report's tutorial picker is deep-linkable:
+append `#<tutorial-slug>` to the report URL (slug = lowercase name with non-alphanumerics
+replaced by hyphens) to open a specific tutorial directly.
+
 ## Watching it live (`--tui`)
 
 `--tui` runs the same two-column view live in your terminal instead of writing a

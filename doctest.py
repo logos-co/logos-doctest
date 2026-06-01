@@ -1979,8 +1979,25 @@ _REPORT_HTML_TEMPLATE = r"""<!DOCTYPE html>
     });
   }
 
-  picker.addEventListener("change", () => render(+picker.value));
-  render(0);
+  function slug(s) {
+    return String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  }
+  function indexFromHash() {
+    const raw = decodeURIComponent(location.hash.replace(/^#/, ""));
+    if (!raw) return 0;
+    if (/^\d+$/.test(raw) && +raw < DATA.tutorials.length) return +raw;
+    const i = DATA.tutorials.findIndex(
+      t => slug(t.meta.name) === raw || t.meta.name === raw
+    );
+    return i >= 0 ? i : 0;
+  }
+  function show(idx) { picker.value = idx; render(idx); }
+  picker.addEventListener("change", () => {
+    location.hash = slug(DATA.tutorials[+picker.value].meta.name);
+    render(+picker.value);
+  });
+  window.addEventListener("hashchange", () => show(indexFromHash()));
+  show(indexFromHash());
 </script>
 </body>
 </html>
