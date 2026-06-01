@@ -206,6 +206,7 @@ Two modes:
 | `wait_for` | `texts`, `timeout` (ms, default 10000), `name` | Poll until all texts are visible |
 | `expect_texts` | `texts` | Assert all texts are visible now |
 | `set_text` | `find_by`, `find_value`, `value` | Find element by property and set its `text` property |
+| `call_method` | `find_by` (default `objectName`), `find_value`, `method`, `args` (list) | Find element by property and invoke a method on it. Use to drive slots that text/property writes can't trigger (e.g. selecting a combobox entry so its `activated` signal fires). |
 | `sleep` | `ms` | Wait a fixed duration |
 
 Any action may also carry an optional **`screenshot`** field (a filename, e.g.

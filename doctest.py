@@ -200,6 +200,8 @@ def _describe_ui_actions(tests):
             detail = f"click {t.get('target', '')!r}"
         elif action == "set_text":
             detail = f"set {t.get('find_by','')}={t.get('find_value','')!r} to {t.get('value','')!r}"
+        elif action == "call_method":
+            detail = f"call {t.get('find_value','')!r}.{t.get('method','')}({', '.join(map(repr, t.get('args', [])))})"
         elif action == "sleep":
             detail = f"sleep {t.get('ms', 0)}ms"
         else:
@@ -725,6 +727,22 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
                 f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("set_text: element not found");\n')
                 f.write(f'    await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "text", value: "{set_val}" }});\n')
+                f.write(f'  }}\n')
+            elif action == "call_method":
+                # Find an object by property (default objectName) and invoke a
+                # method on it via the inspector's callMethod RPC. Unlike `click`
+                # (text-only) and `set_text` (text property only), this drives
+                # arbitrary slots — e.g. a combobox whose `activated` signal must
+                # fire, which a programmatic currentIndex write would not trigger.
+                prop = t.get("find_by", "objectName")
+                val = t.get("find_value", "")
+                method = t.get("method", "")
+                args = _json.dumps(t.get("args", []))
+                f.write(f'  {{\n')
+                f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
+                f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("call_method: element not found");\n')
+                f.write(f'    const res = await app.inspector.send("callMethod", {{ objectId: found.matches[0].id, method: "{method}", args: {args} }});\n')
+                f.write(f'    if (res.error) throw new Error("call_method {method}: " + res.error);\n')
                 f.write(f'  }}\n')
             elif action == "sleep":
                 ms = t.get("ms", 1000)
