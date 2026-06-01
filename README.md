@@ -292,6 +292,8 @@ logos-doctest/
 │   ├── 03-chaining-and-clean.test.yaml     # requires:, --output-dir, --workdir, clean
 │   ├── 04-multispec-and-releases.test.yaml # combined reports, {release}, --release-for
 │   ├── 05-more-spec-features.test.yaml     # encoding:base64, comparison, build_overrides, ui_test
+│   ├── 06-run-sh-and-artifacts.test.yaml   # writing a run.sh: the run/generate loop, outputs/, --release-for
+│   ├── 07-ci-and-github-pages.test.yaml    # CI workflow + publishing reports to GitHub Pages
 │   └── run.sh                              # run + generate the suite locally
 └── .github/workflows/ci.yml   # self-test: example + the doctests/ suite
 ```

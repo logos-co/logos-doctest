@@ -1,0 +1,246 @@
+# Automating a repo's doc-tests with a run.sh
+
+The first five tutorials drove `doctest` one command at a time. A real repo
+keeps its specs under `doctests/` and wraps them in a tiny `run.sh` so a single
+command executes every spec and regenerates its Markdown — the same loop CI
+runs, reproducible on a laptop. This tutorial builds that `run.sh` from scratch,
+runs it for real against an inner spec, and then shows the fuller variant used
+by repos that test their own commit (the shape of
+[`logos-package-manager/doctests/run.sh`](https://github.com/logos-co/logos-package-manager/blob/master/doctests/run.sh)).
+As always, every command here is executed by the outer `doctest`, and inside it
+we author and run a smaller spec.
+
+**What you'll build:** A doctests/ layout with a run.sh that executes every *.test.yaml and renders its Markdown into outputs/, run end-to-end.
+
+**What you'll learn:**
+
+- The conventional `doctests/` layout — specs in, rendered Markdown out
+- How a `run.sh` loops over `*.test.yaml`, calling `run` then `generate`
+- Why the `DOCTEST` override lets the same script use a local checkout or the flake
+- How `--continue-on-fail` keeps the loop going so every spec is exercised
+- How to pin the repo-under-test to its own commit with `--release-for`
+- Where the run leaves outputs (`outputs/`) and which are source vs. artifacts
+
+## Prerequisites
+
+- **Nix** with flakes enabled (see the first tutorial). `bash` and `git` from
+the ambient environment — both are present on any CI runner and most laptops.
+
+---
+
+## The doctests/ convention
+
+Across the Logos repos the pattern is identical: a `doctests/` directory
+holds one or more `*.test.yaml` specs (the **source of truth**) plus a
+`run.sh` that executes them and writes rendered Markdown into `outputs/`.
+
+```
+<repo>/
+└── doctests/
+    ├── 01-something.test.yaml     # spec(s) — committed
+    ├── 02-another.test.yaml
+    ├── run.sh                     # the wrapper — committed
+    └── outputs/                   # rendered .md — committed; run artifacts gitignored
+```
+
+`run.sh` does nothing the earlier tutorials didn't: for each spec it calls
+`doctest run` (execute + assert) then `doctest generate` (render Markdown).
+The value is that it does so for *every* spec, the same way locally and in
+CI, with one command.
+
+## Step 1: Write the specs the script will drive
+
+`run.sh` globs `*.test.yaml`, so the directory needs at least one spec. We
+write a tiny one that produces a file and asserts on it — enough to watch the
+whole loop run.
+
+### 1.1 Create demo.test.yaml
+
+```yaml
+name: "Demo spec"
+output: demo.md
+
+intro: |
+  A throwaway spec so run.sh has something to execute.
+
+sections:
+  - title: "Produce and verify a file"
+    step: true
+    steps:
+      - title: "Write hello.txt"
+        file:
+          path: hello.txt
+          language: text
+          content: |
+            hi from the run.sh demo
+      - title: "Read it back and assert"
+        run: "cat hello.txt"
+        expect_contains:
+          - "hi from the run.sh demo"
+```
+
+---
+
+## Step 2: Write run.sh
+
+The script has four moving parts: it `cd`s to its own directory (so it works
+from anywhere), resolves the `doctest` CLI from a `DOCTEST` override (default:
+the published flake), clears and recreates `outputs/`, then loops over every
+spec running and generating it. `--continue-on-fail` makes the loop walk every
+step of every spec so the run is complete even when something fails — the
+`doctest run` exit code still turns non-zero, which is what fails CI.
+
+### 2.1 Create run.sh
+
+`read -r -a DOCTEST <<< "${DOCTEST:-…}"` splits the override into an array
+so a multi-word command (`nix run … --`) expands correctly. Export
+`DOCTEST` to point at a local checkout instead — e.g.
+`DOCTEST="python3 ../doctest.py" ./run.sh`.
+
+```bash
+#!/usr/bin/env bash
+#
+# Execute every doc-test in this directory end-to-end and regenerate its
+# Markdown. For each *.test.yaml, `doctest run` executes the spec and
+# asserts on the output; `doctest generate` renders it to outputs/.
+#
+# Override the runner by exporting DOCTEST (space-separated command), e.g.
+#   DOCTEST="nix run path:../../logos-doctest --" ./run.sh
+set -euo pipefail
+
+# Run from this directory regardless of where the script is invoked from.
+cd "$(dirname "$0")"
+
+# The doctest CLI. Override by exporting DOCTEST.
+read -r -a DOCTEST <<< "${DOCTEST:-nix run github:logos-co/logos-doctest --}"
+OUTPUT_DIR="./outputs"
+
+echo "==> Clearing previous ${OUTPUT_DIR}/"
+# A prior run may have copied read-only artifacts here; restore perms first.
+if [ -e "${OUTPUT_DIR}" ]; then
+  chmod -R u+w "${OUTPUT_DIR}" 2>/dev/null || true
+fi
+rm -rf "${OUTPUT_DIR}"
+mkdir -p "${OUTPUT_DIR}"
+
+for spec in *.test.yaml; do
+  name="$(basename "${spec%.test.yaml}")"
+  echo "==> Running ${spec}"
+  "${DOCTEST[@]}" run "${spec}" --verbose --continue-on-fail
+
+  echo "==> Generating ${OUTPUT_DIR}/${name}.md"
+  "${DOCTEST[@]}" generate "${spec}" -o "${OUTPUT_DIR}/${name}.md"
+done
+
+echo "==> Done. Rendered docs are in ${OUTPUT_DIR#./}/"
+```
+
+That is the whole wrapper — under 30 lines, and identical in spirit to
+[doctest's own `doctests/run.sh`](https://github.com/logos-co/logos-doctest/blob/master/doctests/run.sh).
+
+---
+
+## Step 3: Run it
+
+Make the script executable and run it. We pass `DOCTEST` so the inner
+`doctest` resolves to the same CLI the outer run is using; omit it and the
+script falls back to the published flake.
+
+### 3.1 Execute the whole suite
+
+Watch the loop: it clears `outputs/`, runs `demo.test.yaml` (the inner
+assertion passes), then renders `outputs/demo.md`:
+
+```bash
+chmod +x run.sh
+./run.sh
+```
+
+One command executed the spec, asserted on it, and rendered its docs —
+exactly what CI does, minus the report and publishing (the next tutorial).
+
+### 3.2 Confirm the rendered Markdown was written
+
+### 3.3 Inspect what the loop produced
+
+The rendered tutorial carries the spec's `name` as its title and the
+file's contents, generated from the spec that was just verified:
+
+```bash
+cat outputs/demo.md
+```
+
+---
+
+## Step 4: Pinning the repo under test (--release-for)
+
+The demo above had no GitHub URLs, so the default `run.sh` was enough. A repo
+whose specs build *itself* — `nix build 'github:logos-co/<repo>'` — needs one
+addition: by default that URL resolves to **latest master**, not the commit
+you are testing. `--release-for <repo>=<commit>` rewrites the release
+placeholder on that URL to a specific commit, so the doc-tests exercise the
+code in front of you.
+
+This is the only difference between the minimal `run.sh` above and the fuller
+one in repos like `logos-package-manager`. It resolves `COMMIT` from
+`git rev-parse HEAD` (override by exporting `COMMIT`, or set `COMMIT=""` to
+fall back to latest) and threads `--release-for` through both `run` and
+`generate`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+
+read -r -a DOCTEST <<< "${DOCTEST:-nix run github:logos-co/logos-doctest --}"
+
+# Pin github:logos-co/<repo> in every spec to THIS checkout's commit, so the
+# doc-tests build exactly what's here rather than the latest published flake.
+# nix fetches the commit from the GitHub remote, so it must be pushed; set
+# COMMIT="" (or push first) to fall back to latest.
+COMMIT="${COMMIT-$(git rev-parse HEAD)}"
+RELEASE_FOR=()
+if [ -n "${COMMIT}" ]; then
+  RELEASE_FOR=(--release-for "myrepo=${COMMIT}")
+  echo "==> Pinning myrepo to ${COMMIT}"
+else
+  echo "==> COMMIT empty; building myrepo from latest"
+fi
+
+mkdir -p outputs
+for spec in *.test.yaml; do
+  name="$(basename "${spec%.test.yaml}")"
+  # The ${RELEASE_FOR[@]+...} guard keeps an empty array from tripping
+  # `set -u` on older bash (e.g. macOS's stock 3.2).
+  "${DOCTEST[@]}" run "${spec}" --verbose --continue-on-fail \
+    ${RELEASE_FOR[@]+"${RELEASE_FOR[@]}"}
+  "${DOCTEST[@]}" generate "${spec}" \
+    ${RELEASE_FOR[@]+"${RELEASE_FOR[@]}"} \
+    -o "outputs/${name}.md"
+done
+```
+
+Replace `myrepo` with your repo's GitHub name. Tutorial 4 covers
+`--release-for` (and per-repo pins) in depth; here it is just the one flag
+that makes a self-building suite test the right commit.
+
+---
+
+## outputs/: source vs. artifacts
+
+`run.sh` writes everything under `outputs/`, but not all of it is the same
+kind of thing:
+
+- The rendered `outputs/*.md` are **generated source** — commit them so the
+  repo always shows the latest docs (the `.gitignore` pattern
+  `outputs/*` + `!outputs/*.md` keeps the Markdown, drops the rest).
+- Anything a spec *builds* into its workdir (out-links, compiled libraries,
+  copied `modules/`, logs) is a **disposable artifact**. When a suite runs
+  with `--output-dir` (rather than the auto-deleted temp dir), strip those
+  with `doctest clean outputs/` before committing — Tutorial 3 covers it, and
+  `logos-tutorial`'s `run.sh` chains `run` → `generate` → `clean` for exactly
+  this reason.
+
+With a `run.sh` in place, the suite is reproducible with one command. The
+next tutorial takes the same two calls — `run` and `generate` — and wires
+them into CI, adding a published HTML report.
