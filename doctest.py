@@ -642,20 +642,32 @@ def _screenshot_filename(raw):
     return name
 
 
-def _screenshot_md_lines(ui_test_spec, images_dir=None):
-    """Markdown image embeds for any ui_test action carrying a `screenshot:`
-    field.
+def _ui_action_md_blocks(ui_test_spec, images_dir=None):
+    """Markdown blocks for ui_test actions carrying a `text:` and/or
+    `screenshot:` field.
 
-    With no `images_dir` (the published-tutorial generator), emit a relative
-    link `images/<file>.png` so it resolves from the generated .md in outputs/.
-    With an `images_dir` (the self-contained HTML report), inline the captured
-    PNG as a base64 `data:` URI when the file exists — so the report stays a
-    single portable file that renders the screenshots even when served from
-    GitHub Pages; fall back to the relative link if the capture is missing."""
+    For each action, an optional `text:` is rendered as a paragraph; when the
+    action also has a `screenshot:`, that text appears immediately *above* the
+    embedded image. Both fields are optional and independent — an action may
+    contribute a caption, an image, both, or (the common case) neither.
+
+    With no `images_dir` (the published-tutorial generator), screenshots use a
+    relative link `images/<file>.png` so it resolves from the generated .md in
+    outputs/. With an `images_dir` (the self-contained HTML report), inline the
+    captured PNG as a base64 `data:` URI when the file exists — so the report
+    stays a single portable file that renders the screenshots even when served
+    from GitHub Pages; fall back to the relative link if the capture is missing.
+
+    Returns a list of blocks; each block is a self-contained markdown string
+    (a caption may be multi-line) that the caller emits followed by a blank
+    line."""
     import base64 as _base64
-    lines = []
+    blocks = []
     for t in ui_test_spec.get("tests", []):
+        caption = t.get("text", "")
         fname = _screenshot_filename(t.get("screenshot", ""))
+        if caption:
+            blocks.append(expand_vars(str(caption)).rstrip("\n"))
         if not fname:
             continue
         alt = t.get("name") or os.path.splitext(fname)[0]
@@ -668,8 +680,8 @@ def _screenshot_md_lines(ui_test_spec, images_dir=None):
                 src = f"data:image/png;base64,{b64}"
             except OSError:
                 pass  # capture missing (e.g. step failed) — keep relative link
-        lines.append(f"![{alt}]({src})")
-    return lines
+        blocks.append(f"![{alt}]({src})")
+    return blocks
 
 
 def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=None):
@@ -1416,8 +1428,8 @@ def _step_to_markdown(step, sec_num, sub_step, images_dir=None):
             emit(expand_vars(launch))
             emit("```")
             emit()
-        for img in _screenshot_md_lines(ui_test_spec, images_dir):
-            emit(img)
+        for block in _ui_action_md_blocks(ui_test_spec, images_dir):
+            emit_block(block)
             emit()
 
     post_text = step.get("post_text", "")
@@ -2267,8 +2279,8 @@ def cmd_generate(args):
                     emit(expand_vars(launch))
                     emit("```")
                     emit()
-                for img in _screenshot_md_lines(ui_test_spec):
-                    emit(img)
+                for block in _ui_action_md_blocks(ui_test_spec):
+                    emit_block(block)
                     emit()
 
             # check_file is runner-only verification, not rendered in markdown

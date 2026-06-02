@@ -218,6 +218,15 @@ section as `![<name>](images/<file>.png)`, so screenshots appear in the
 published tutorial with no extra markup. The `.png` extension is added if
 omitted; the value is reduced to a basename.
 
+Any action may also carry an optional **`text`** field: prose (full markdown,
+supports `{var}` expansion) rendered in the generated tutorial and the HTML
+report at that point in the action sequence. When the same action also has a
+`screenshot`, the text is rendered **immediately above** the image, acting as
+its caption; otherwise it stands on its own. `text` is purely documentation — it
+does not affect what the UI test executes. Use it to narrate what each
+screenshot shows or to annotate a step inline, rather than collecting all prose
+in `post_text`.
+
 The two-column HTML report (`--report`) inlines each captured screenshot as a
 base64 `data:` URI, so the report stays a single self-contained file that
 renders the screenshots even when served from GitHub Pages (where only the
@@ -254,6 +263,8 @@ report falls back to the relative `images/<file>.png` link.
         action: wait_for
         texts: ["3"]
         timeout: 10000
+        text: "The calculator displays **3** after adding the inputs."
+        screenshot: "result.png"   # the text above renders as this image's caption
 ```
 
 #### `post_text` (string, optional)
