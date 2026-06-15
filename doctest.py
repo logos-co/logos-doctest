@@ -1074,6 +1074,30 @@ def _dispatch_step(step, workdir, results, args, override_flags, spec):
 
 
 def run_single_spec(spec, spec_path, workdir, args, results):
+    """Run a single tutorial spec, isolating its logoscore config tree.
+
+    The logoscore daemon refuses to start if another daemon already owns its
+    config dir (default ~/.logoscore), which is shared across every spec in a
+    run. A spec that leaks a daemon (no `logoscore stop`) would otherwise block
+    the NEXT spec's daemon from starting — and because specs background it with
+    `&`, that failure is silent and the next spec's commands hit the stale
+    daemon. Point LOGOSCORE_CONFIG_DIR at a per-spec dir under the workdir so
+    each spec's daemon/state/tokens are isolated and leaked daemons are inert.
+    """
+    config_dir = os.path.join(workdir, ".logoscore")
+    os.makedirs(config_dir, exist_ok=True)
+    prev = os.environ.get("LOGOSCORE_CONFIG_DIR")
+    os.environ["LOGOSCORE_CONFIG_DIR"] = config_dir
+    try:
+        _run_single_spec(spec, spec_path, workdir, args, results)
+    finally:
+        if prev is None:
+            os.environ.pop("LOGOSCORE_CONFIG_DIR", None)
+        else:
+            os.environ["LOGOSCORE_CONFIG_DIR"] = prev
+
+
+def _run_single_spec(spec, spec_path, workdir, args, results):
     """Run a single tutorial spec in the given workdir. May raise StopEarly."""
     spec_dir = os.path.dirname(spec_path)
 
