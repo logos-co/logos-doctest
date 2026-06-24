@@ -749,11 +749,13 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 prop = t.get("find_by", "objectName")
                 val = t.get("find_value", "")
                 set_prop = t.get("property", "")
-                set_val = t.get("value", "")
+                # JSON-encode the value so it survives as a JS string literal even
+                # when it contains quotes/newlines (e.g. a JSON config blob).
+                set_val = _json.dumps(t.get("value", ""))
                 f.write(f'  {{\n')
                 f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
                 f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("set_property: element not found");\n')
-                f.write(f'    await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "{set_prop}", value: "{set_val}" }});\n')
+                f.write(f'    await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "{set_prop}", value: {set_val} }});\n')
                 f.write(f'  }}\n')
             elif action == "call_method":
                 # Find an object by property (default objectName) and invoke a
