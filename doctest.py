@@ -204,6 +204,8 @@ def _describe_ui_actions(tests):
             detail = f"set {t.get('find_by','')}={t.get('find_value','')!r} .{t.get('property','')} to {t.get('value','')!r}"
         elif action == "expect_property":
             detail = f"expect {t.get('find_by','')}={t.get('find_value','')!r} .{t.get('property','')} == {t.get('value','')!r}"
+        elif action == "click_object":
+            detail = f"click {t.get('find_by','')}={t.get('find_value','')!r}"
         elif action == "call_method":
             detail = f"call {t.get('find_value','')!r}.{t.get('method','')}({', '.join(map(repr, t.get('args', [])))})"
         elif action == "sleep":
@@ -790,6 +792,17 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("call_method: element not found");\n')
                 f.write(f'    const res = await app.inspector.send("callMethod", {{ objectId: found.matches[0].id, method: "{method}", args: {args} }});\n')
                 f.write(f'    if (res.error) throw new Error("call_method {method}: " + res.error);\n')
+                f.write(f'  }}\n')
+            elif action == "click_object":
+                # Click an element found by property (default objectName) rather
+                # than by visible text. Synthesizes a real mouse click at the
+                # item's position, so use it for buttons/areas with no text label.
+                prop = t.get("find_by", "objectName")
+                val = t.get("find_value", "")
+                f.write(f'  {{\n')
+                f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
+                f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("click_object: element not found");\n')
+                f.write(f'    await app.inspector.send("click", {{ objectId: found.matches[0].id }});\n')
                 f.write(f'  }}\n')
             elif action == "sleep":
                 ms = t.get("ms", 1000)
