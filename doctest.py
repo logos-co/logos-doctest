@@ -202,6 +202,8 @@ def _describe_ui_actions(tests):
             detail = f"set {t.get('find_by','')}={t.get('find_value','')!r} to {t.get('value','')!r}"
         elif action == "set_property":
             detail = f"set {t.get('find_by','')}={t.get('find_value','')!r} .{t.get('property','')} to {t.get('value','')!r}"
+        elif action == "expect_property":
+            detail = f"expect {t.get('find_by','')}={t.get('find_value','')!r} .{t.get('property','')} == {t.get('value','')!r}"
         elif action == "call_method":
             detail = f"call {t.get('find_value','')!r}.{t.get('method','')}({', '.join(map(repr, t.get('args', [])))})"
         elif action == "sleep":
@@ -756,6 +758,24 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
                 f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("set_property: element not found");\n')
                 f.write(f'    await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "{set_prop}", value: {set_val} }});\n')
+                f.write(f'  }}\n')
+            elif action == "expect_property":
+                # Assert a property's current value. Reads it back via
+                # getProperties (which returns { properties: [{name,value},...] })
+                # and compares JSON-encoded values, so it works for bools,
+                # numbers and strings alike — e.g. assert a config editor's
+                # `isValid` is false for malformed input.
+                prop = t.get("find_by", "objectName")
+                val = t.get("find_value", "")
+                check_prop = t.get("property", "")
+                expected = _json.dumps(t.get("value", ""))
+                f.write(f'  {{\n')
+                f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
+                f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("expect_property: element not found");\n')
+                f.write(f'    const info = await app.inspector.send("getProperties", {{ objectId: found.matches[0].id }});\n')
+                f.write(f'    const entry = (info.properties || []).find(p => p.name === "{check_prop}");\n')
+                f.write(f'    if (!entry) throw new Error("expect_property: no property {check_prop}");\n')
+                f.write(f'    if (JSON.stringify(entry.value) !== JSON.stringify({expected})) throw new Error("expect_property {check_prop}: expected " + JSON.stringify({expected}) + " got " + JSON.stringify(entry.value));\n')
                 f.write(f'  }}\n')
             elif action == "call_method":
                 # Find an object by property (default objectName) and invoke a
