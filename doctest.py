@@ -200,6 +200,8 @@ def _describe_ui_actions(tests):
             detail = f"click {t.get('target', '')!r}"
         elif action == "set_text":
             detail = f"set {t.get('find_by','')}={t.get('find_value','')!r} to {t.get('value','')!r}"
+        elif action == "set_property":
+            detail = f"set {t.get('find_by','')}={t.get('find_value','')!r} .{t.get('property','')} to {t.get('value','')!r}"
         elif action == "call_method":
             detail = f"call {t.get('find_value','')!r}.{t.get('method','')}({', '.join(map(repr, t.get('args', [])))})"
         elif action == "sleep":
@@ -739,6 +741,19 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
                 f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("set_text: element not found");\n')
                 f.write(f'    await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "text", value: "{set_val}" }});\n')
+                f.write(f'  }}\n')
+            elif action == "set_property":
+                # Like set_text, but writes an arbitrary property — needed for
+                # non-text properties such as a FileDialog's `selectedFile` (a
+                # url), which set_text (hardcoded to "text") cannot drive.
+                prop = t.get("find_by", "objectName")
+                val = t.get("find_value", "")
+                set_prop = t.get("property", "")
+                set_val = t.get("value", "")
+                f.write(f'  {{\n')
+                f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
+                f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("set_property: element not found");\n')
+                f.write(f'    await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "{set_prop}", value: "{set_val}" }});\n')
                 f.write(f'  }}\n')
             elif action == "call_method":
                 # Find an object by property (default objectName) and invoke a
