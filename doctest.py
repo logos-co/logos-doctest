@@ -745,9 +745,8 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 f.write(f'    await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "text", value: "{set_val}" }});\n')
                 f.write(f'  }}\n')
             elif action == "set_property":
-                # Like set_text, but writes an arbitrary property — needed for
-                # non-text properties such as a FileDialog's `selectedFile` (a
-                # url), which set_text (hardcoded to "text") cannot drive.
+                # Like set_text, but writes a named property instead of only
+                # `text`, so specs can drive url/bool/number/enum properties too.
                 prop = t.get("find_by", "objectName")
                 val = t.get("find_value", "")
                 set_prop = t.get("property", "")
@@ -760,11 +759,10 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 f.write(f'    await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "{set_prop}", value: {set_val} }});\n')
                 f.write(f'  }}\n')
             elif action == "expect_property":
-                # Assert a property's current value. Reads it back via
-                # getProperties (which returns { properties: [{name,value},...] })
-                # and compares JSON-encoded values, so it works for bools,
-                # numbers and strings alike — e.g. assert a config editor's
-                # `isValid` is false for malformed input.
+                # Assert a named property's current value. Reads it back via
+                # getProperties (response shape: { properties: [{name,value},...] })
+                # and compares JSON-encoded values, so bools, numbers and strings
+                # all work. Lets specs assert UI state, not just text presence.
                 prop = t.get("find_by", "objectName")
                 val = t.get("find_value", "")
                 check_prop = t.get("property", "")
