@@ -1975,6 +1975,7 @@ _REPORT_HTML_TEMPLATE = r"""<!DOCTYPE html>
   .md table { border-collapse: collapse; margin: 8px 0; }
   .md th, .md td { border: 1px solid var(--border); padding: 5px 10px; }
   .md blockquote { border-left: 3px solid var(--border); margin: 8px 0; padding: 2px 12px; color: var(--muted); }
+  .md img { width: 100%; height: auto; border: 1px solid var(--border); border-radius: 6px; }
   .exec { margin-bottom: 14px; }
   .exec:last-child { margin-bottom: 0; }
   .exec-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
