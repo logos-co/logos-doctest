@@ -200,6 +200,12 @@ def _describe_ui_actions(tests):
             detail = f"click {t.get('target', '')!r}"
         elif action == "set_text":
             detail = f"set {t.get('find_by','')}={t.get('find_value','')!r} to {t.get('value','')!r}"
+        elif action == "set_property":
+            detail = f"set {t.get('find_by','')}={t.get('find_value','')!r} .{t.get('property','')} to {t.get('value','')!r}"
+        elif action == "expect_property":
+            detail = f"expect {t.get('find_by','')}={t.get('find_value','')!r} .{t.get('property','')} == {t.get('value','')!r}"
+        elif action == "click_object":
+            detail = f"click {t.get('find_by','')}={t.get('find_value','')!r}"
         elif action == "call_method":
             detail = f"call {t.get('find_value','')!r}.{t.get('method','')}({', '.join(map(repr, t.get('args', [])))})"
         elif action == "sleep":
@@ -740,6 +746,37 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("set_text: element not found");\n')
                 f.write(f'    await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "text", value: "{set_val}" }});\n')
                 f.write(f'  }}\n')
+            elif action == "set_property":
+                # Like set_text, but writes a named property instead of only
+                # `text`, so specs can drive url/bool/number/enum properties too.
+                prop = t.get("find_by", "objectName")
+                val = t.get("find_value", "")
+                set_prop = t.get("property", "")
+                # JSON-encode the value so it survives as a JS string literal even
+                # when it contains quotes/newlines (e.g. a JSON config blob).
+                set_val = _json.dumps(t.get("value", ""))
+                f.write(f'  {{\n')
+                f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
+                f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("set_property: element not found");\n')
+                f.write(f'    await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "{set_prop}", value: {set_val} }});\n')
+                f.write(f'  }}\n')
+            elif action == "expect_property":
+                # Assert a named property's current value. Reads it back via
+                # getProperties (response shape: { properties: [{name,value},...] })
+                # and compares JSON-encoded values, so bools, numbers and strings
+                # all work. Lets specs assert UI state, not just text presence.
+                prop = t.get("find_by", "objectName")
+                val = t.get("find_value", "")
+                check_prop = t.get("property", "")
+                expected = _json.dumps(t.get("value", ""))
+                f.write(f'  {{\n')
+                f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
+                f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("expect_property: element not found");\n')
+                f.write(f'    const info = await app.inspector.send("getProperties", {{ objectId: found.matches[0].id }});\n')
+                f.write(f'    const entry = (info.properties || []).find(p => p.name === "{check_prop}");\n')
+                f.write(f'    if (!entry) throw new Error("expect_property: no property {check_prop}");\n')
+                f.write(f'    if (JSON.stringify(entry.value) !== JSON.stringify({expected})) throw new Error("expect_property {check_prop}: expected " + JSON.stringify({expected}) + " got " + JSON.stringify(entry.value));\n')
+                f.write(f'  }}\n')
             elif action == "call_method":
                 # Find an object by property (default objectName) and invoke a
                 # method on it via the inspector's callMethod RPC. Unlike `click`
@@ -755,6 +792,17 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("call_method: element not found");\n')
                 f.write(f'    const res = await app.inspector.send("callMethod", {{ objectId: found.matches[0].id, method: "{method}", args: {args} }});\n')
                 f.write(f'    if (res.error) throw new Error("call_method {method}: " + res.error);\n')
+                f.write(f'  }}\n')
+            elif action == "click_object":
+                # Click an element found by property (default objectName) rather
+                # than by visible text. Synthesizes a real mouse click at the
+                # item's position, so use it for buttons/areas with no text label.
+                prop = t.get("find_by", "objectName")
+                val = t.get("find_value", "")
+                f.write(f'  {{\n')
+                f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
+                f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("click_object: element not found");\n')
+                f.write(f'    await app.inspector.send("click", {{ objectId: found.matches[0].id }});\n')
                 f.write(f'  }}\n')
             elif action == "sleep":
                 ms = t.get("ms", 1000)
@@ -1927,6 +1975,7 @@ _REPORT_HTML_TEMPLATE = r"""<!DOCTYPE html>
   .md table { border-collapse: collapse; margin: 8px 0; }
   .md th, .md td { border: 1px solid var(--border); padding: 5px 10px; }
   .md blockquote { border-left: 3px solid var(--border); margin: 8px 0; padding: 2px 12px; color: var(--muted); }
+  .md img { width: 100%; height: auto; border: 1px solid var(--border); border-radius: 6px; }
   .exec { margin-bottom: 14px; }
   .exec:last-child { margin-bottom: 0; }
   .exec-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
