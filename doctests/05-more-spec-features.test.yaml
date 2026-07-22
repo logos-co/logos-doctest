@@ -187,6 +187,76 @@ sections:
           (e.g. `../logos-cpp-sdk`) so `nix build` resolves against your local
           code; `generate` would still render the plain `nix build .#demo`.
 
+  - title: "--workspace-pins: build against a multi-repo snapshot"
+    step: true
+    text: |
+      `build_overrides` is per-spec and points at local paths. `--workspace-pins`
+      is the multi-repo counterpart: you hand the runner a
+      `{repo: {owner, rev}}` map of a workspace snapshot, and it forces every
+      command it can onto that snapshot.
+
+      It exists because pinning a spec's `{release}` URLs is not enough. Nix
+      resolves a repo flake from **its own committed `flake.lock`**, so a spec
+      that builds `github:org/some-repo/<sha>` still gets whatever *that* repo
+      locked its dependencies to — which may be a commit your snapshot does not
+      pin. Two rewrites close the gap:
+
+      - each `nix build`/`nix run`/`nix develop` of a repo in the map gains
+        `--override-input` flags pinning its inputs to the snapshot;
+      - each `git clone` of a repo in the map is followed by a fetch and detach
+        onto the pinned commit — a plain git URL is not a flake ref, so nothing
+        else pins it and the clone tracks the default branch.
+
+      This trades away binary-cache reuse for fidelity, so it is meant for a
+      snapshot-validation job rather than everyday runs. The clone rewrite is
+      pure string manipulation, so we can prove it here without a toolchain.
+    steps:
+      - title: "Write a pin map"
+        file:
+          path: ws-pins.json
+          language: json
+          content: |
+            {
+              "logos-cpp-sdk": {
+                "owner": "logos-co",
+                "rev": "1111111111111111111111111111111111111111"
+              }
+            }
+
+      - title: "Write a spec that clones a pinned repo"
+        file:
+          path: pins-clone.test.yaml
+          language: yaml
+          content: |
+            name: "workspace-pins demo"
+            output: wp.md
+            sections:
+              - title: "A clone command"
+                step: true
+                steps:
+                  - title: "Clone a repo (echoed, not really cloned)"
+                    run: "echo 'git clone --depth 1 https://github.com/logos-co/logos-cpp-sdk.git'"
+                    expect_contains:
+                      - "checkout --detach FETCH_HEAD"
+
+      - title: "Run it — the clone is pinned to the snapshot"
+        text: |
+          The inner spec clones `logos-cpp-sdk`, which the pin map lists, so the
+          runner appends a fetch of the pinned commit and a detached checkout.
+          The inner `expect_contains` asserts that, so a passing summary proves
+          the rewrite happened:
+        run: "nix run github:logos-co/logos-doctest{release} -- run pins-clone.test.yaml --verbose --workspace-pins ws-pins.json"
+        code_block: "doctest run pins-clone.test.yaml --verbose --workspace-pins ws-pins.json"
+        expect_contains:
+          - "1111111111111111111111111111111111111111"
+          - "checkout --detach FETCH_HEAD"
+          - "1 passed, 0 failed"
+        post_text: |
+          Without `--workspace-pins` the same command is left untouched, and a
+          repo missing from the map is never rewritten — so adding the flag can
+          only tighten which commits a run uses, never redirect a clone the
+          snapshot says nothing about.
+
   - title: "ui_test: headless Qt UI checks (reference only)"
     text: |
       The last feature, `ui_test`, drives a **real Qt application** through

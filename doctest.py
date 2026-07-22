@@ -359,10 +359,14 @@ def _installable_of(cmd):
     m = _NIX_SUBCMD_RE.search(cmd)
     if not m:
         return None
+    tail = cmd[m.end():]
     try:
-        tokens = shlex.split(cmd[m.end():])
+        tokens = shlex.split(tail)
     except ValueError:
-        return None
+        # Unbalanced quotes — the match is inside a quoted string, e.g. the
+        # `echo 'nix build .#demo'` used to observe injection without building.
+        # Fall back to a naive split rather than losing the command entirely.
+        tokens = tail.replace("'", " ").replace('"', " ").split()
     i = 0
     while i < len(tokens):
         tok = tokens[i]
@@ -488,16 +492,27 @@ def inject_nix_overrides(cmd, override_flags, workdir=None):
     flake.lock -- nix resolves a foreign repo flake from ITS committed lock,
     so the workspace's `follows` never reach it otherwise.
     """
-    ref = _installable_of(cmd)
-    if ref is None:
-        return pin_git_clones(cmd)
+    cmd = pin_git_clones(cmd)
     extra = []
-    if override_flags:
+
+    # Spec-level build_overrides keep their long-standing "the command mentions
+    # a nix subcommand, so append" semantics — documented and self-tested in
+    # doctests/05-more-spec-features.test.yaml, which asserts injection into
+    # `echo 'nix build .#demo'`. (Widened from `nix build` only: it never
+    # reached `nix run` launches, i.e. every ui_test, or `nix develop`.)
+    if override_flags and _NIX_SUBCMD_RE.search(cmd):
         extra.append(override_flags)
-    if WORKSPACE_PINS and _is_workspace_scoped(ref):
-        ws = _workspace_override_flags(ref, workdir)
-        if ws:
-            extra.append(ws)
+
+    # Workspace pinning needs the actual installable, so it is deliberately
+    # stricter: it must know WHICH flake to resolve before it can compute the
+    # override paths.
+    if WORKSPACE_PINS:
+        ref = _installable_of(cmd)
+        if ref and _is_workspace_scoped(ref):
+            ws = _workspace_override_flags(ref, workdir)
+            if ws:
+                extra.append(ws)
+
     return f"{cmd} {' '.join(extra)}" if extra else cmd
 
 
