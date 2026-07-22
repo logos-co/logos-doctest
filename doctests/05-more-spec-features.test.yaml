@@ -212,18 +212,25 @@ sections:
       pure string manipulation, so we can prove it here without a toolchain.
     steps:
       - title: "Write a pin map"
+        text: |
+          One entry is enough. We pin `logos-doctest` itself to its very first
+          commit — a fixed, permanent object, so this test asserts an exact
+          value rather than whatever `master` happens to be:
         file:
           path: ws-pins.json
           language: json
           content: |
             {
-              "logos-cpp-sdk": {
+              "logos-doctest": {
                 "owner": "logos-co",
-                "rev": "1111111111111111111111111111111111111111"
+                "rev": "4e6b08b064833aa12768ace97c21e8c3d15d6690"
               }
             }
 
       - title: "Write a spec that clones a pinned repo"
+        text: |
+          The spec clones the default branch and prints the commit it landed on.
+          Nothing in it mentions the pinned revision:
         file:
           path: pins-clone.test.yaml
           language: yaml
@@ -234,28 +241,28 @@ sections:
               - title: "A clone command"
                 step: true
                 steps:
-                  - title: "Clone a repo (echoed, not really cloned)"
-                    run: "echo 'git clone --depth 1 https://github.com/logos-co/logos-cpp-sdk.git'"
+                  - title: "Clone a repo and report its HEAD"
+                    run: "git clone --depth 1 https://github.com/logos-co/logos-doctest.git && git -C logos-doctest rev-parse HEAD"
                     expect_contains:
-                      - "checkout --detach FETCH_HEAD"
+                      - "4e6b08b064833aa12768ace97c21e8c3d15d6690"
 
-      - title: "Run it — the clone is pinned to the snapshot"
+      - title: "Run it — the clone lands on the pinned commit"
         text: |
-          The inner spec clones `logos-cpp-sdk`, which the pin map lists, so the
-          runner appends a fetch of the pinned commit and a detached checkout.
-          The inner `expect_contains` asserts that, so a passing summary proves
-          the rewrite happened:
+          `logos-doctest` is in the pin map, so the runner appends a fetch of the
+          pinned commit and a detached checkout. The clone therefore reports the
+          pinned revision instead of the tip of the default branch, and the inner
+          `expect_contains` asserts exactly that:
         run: "nix run github:logos-co/logos-doctest{release} -- run pins-clone.test.yaml --verbose --workspace-pins ws-pins.json"
         code_block: "doctest run pins-clone.test.yaml --verbose --workspace-pins ws-pins.json"
         expect_contains:
-          - "1111111111111111111111111111111111111111"
           - "checkout --detach FETCH_HEAD"
+          - "4e6b08b064833aa12768ace97c21e8c3d15d6690"
           - "1 passed, 0 failed"
         post_text: |
-          Without `--workspace-pins` the same command is left untouched, and a
-          repo missing from the map is never rewritten — so adding the flag can
-          only tighten which commits a run uses, never redirect a clone the
-          snapshot says nothing about.
+          Without `--workspace-pins` the same command clones the default branch
+          and the assertion would fail. A repo missing from the map is never
+          rewritten — so adding the flag can only tighten which commits a run
+          uses, never redirect a clone the snapshot says nothing about.
 
   - title: "ui_test: headless Qt UI checks (reference only)"
     text: |
