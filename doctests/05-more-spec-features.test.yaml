@@ -187,6 +187,83 @@ sections:
           (e.g. `../logos-cpp-sdk`) so `nix build` resolves against your local
           code; `generate` would still render the plain `nix build .#demo`.
 
+  - title: "--workspace-pins: build against a multi-repo snapshot"
+    step: true
+    text: |
+      `build_overrides` is per-spec and points at local paths. `--workspace-pins`
+      is the multi-repo counterpart: you hand the runner a
+      `{repo: {owner, rev}}` map of a workspace snapshot, and it forces every
+      command it can onto that snapshot.
+
+      It exists because pinning a spec's `{release}` URLs is not enough. Nix
+      resolves a repo flake from **its own committed `flake.lock`**, so a spec
+      that builds `github:org/some-repo/<sha>` still gets whatever *that* repo
+      locked its dependencies to — which may be a commit your snapshot does not
+      pin. Two rewrites close the gap:
+
+      - each `nix build`/`nix run`/`nix develop` of a repo in the map gains
+        `--override-input` flags pinning its inputs to the snapshot;
+      - each `git clone` of a repo in the map is followed by a fetch and detach
+        onto the pinned commit — a plain git URL is not a flake ref, so nothing
+        else pins it and the clone tracks the default branch.
+
+      This trades away binary-cache reuse for fidelity, so it is meant for a
+      snapshot-validation job rather than everyday runs. The clone rewrite is
+      pure string manipulation, so we can prove it here without a toolchain.
+    steps:
+      - title: "Write a pin map"
+        text: |
+          One entry is enough. We pin `logos-doctest` itself to its very first
+          commit — a fixed, permanent object, so this test asserts an exact
+          value rather than whatever `master` happens to be:
+        file:
+          path: ws-pins.json
+          language: json
+          content: |
+            {
+              "logos-doctest": {
+                "owner": "logos-co",
+                "rev": "4e6b08b064833aa12768ace97c21e8c3d15d6690"
+              }
+            }
+
+      - title: "Write a spec that clones a pinned repo"
+        text: |
+          The spec clones the default branch and prints the commit it landed on.
+          Nothing in it mentions the pinned revision:
+        file:
+          path: pins-clone.test.yaml
+          language: yaml
+          content: |
+            name: "workspace-pins demo"
+            output: wp.md
+            sections:
+              - title: "A clone command"
+                step: true
+                steps:
+                  - title: "Clone a repo and report its HEAD"
+                    run: "git clone --depth 1 https://github.com/logos-co/logos-doctest.git && git -C logos-doctest rev-parse HEAD"
+                    expect_contains:
+                      - "4e6b08b064833aa12768ace97c21e8c3d15d6690"
+
+      - title: "Run it — the clone lands on the pinned commit"
+        text: |
+          `logos-doctest` is in the pin map, so the runner appends a fetch of the
+          pinned commit and a detached checkout. The clone therefore reports the
+          pinned revision instead of the tip of the default branch, and the inner
+          `expect_contains` asserts exactly that:
+        run: "nix run github:logos-co/logos-doctest{release} -- run pins-clone.test.yaml --verbose --workspace-pins ws-pins.json"
+        code_block: "doctest run pins-clone.test.yaml --verbose --workspace-pins ws-pins.json"
+        expect_contains:
+          - "checkout --detach FETCH_HEAD"
+          - "4e6b08b064833aa12768ace97c21e8c3d15d6690"
+          - "1 passed, 0 failed"
+        post_text: |
+          Without `--workspace-pins` the same command clones the default branch
+          and the assertion would fail. A repo missing from the map is never
+          rewritten — so adding the flag can only tighten which commits a run
+          uses, never redirect a clone the snapshot says nothing about.
+
   - title: "ui_test: headless Qt UI checks (reference only)"
     text: |
       The last feature, `ui_test`, drives a **real Qt application** through
