@@ -49,10 +49,13 @@ Clean options:
 
 import argparse
 import base64
+import collections
 import glob
+import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -320,11 +323,182 @@ def parse_build_overrides(spec, spec_dir):
     return " ".join(flags)
 
 
-def inject_nix_overrides(cmd, override_flags):
-    """Append nix override flags to nix build commands."""
-    if override_flags and "nix build" in cmd:
-        return f"{cmd} {override_flags}"
-    return cmd
+# Workspace pins: {repo: {"owner": ..., "rev": ...}}, loaded from --workspace-pins.
+# Empty unless that flag is passed, so this whole feature is opt-in.
+WORKSPACE_PINS = {}
+_WS_FLAGS_CACHE = {}
+
+# nix subcommands that take an installable and accept --override-input.
+_NIX_SUBCMD_RE = re.compile(r"\bnix\s+(build|run|develop|shell)\b")
+
+# nix flags that consume following argument(s); anything else starting with '-'
+# is a bare switch. Used to find the installable in an arbitrary command line.
+_NIX_VALUE_FLAGS = {
+    "-o": 1, "--out-link": 1, "--profile": 1, "--store": 1, "--eval-store": 1,
+    "--override-input": 2, "--update-input": 1, "--inputs-from": 1,
+    "--arg": 2, "--argstr": 2, "--option": 2, "--log-format": 1,
+    "-j": 1, "--max-jobs": 1, "--cores": 1, "--builders": 1, "--priority": 1,
+    "--experimental-features": 1, "--extra-experimental-features": 1,
+    "--substituters": 1, "--extra-substituters": 1, "--out-paths": 1,
+}
+
+
+def load_workspace_pins(path):
+    """Load a {repo: {owner, rev}} pin map produced from the workspace's
+    submodule state. Enables workspace-snapshot override injection."""
+    global WORKSPACE_PINS
+    with open(path) as f:
+        WORKSPACE_PINS = json.load(f)
+    return WORKSPACE_PINS
+
+
+def _installable_of(cmd):
+    """Return the flake reference a `nix build|run|develop` command targets,
+    or None if this is not such a command. Fragments (`.#lgx`) are stripped;
+    a command with no explicit installable defaults to '.'."""
+    m = _NIX_SUBCMD_RE.search(cmd)
+    if not m:
+        return None
+    try:
+        tokens = shlex.split(cmd[m.end():])
+    except ValueError:
+        return None
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--":
+            break
+        if tok.startswith("-"):
+            i += 1 + _NIX_VALUE_FLAGS.get(tok, 0)
+            continue
+        return tok.split("#", 1)[0]
+    return "."
+
+
+def _is_workspace_scoped(ref):
+    """Only inject into flakes that ARE the workspace snapshot: local paths
+    (the repo under test, or something it cloned) and github refs naming a
+    workspace repo. Third-party flakes and the test driver (logos-qt-mcp,
+    logos-doctest) are left on their own locks — rebuilding them against the
+    snapshot buys no fidelity for the thing under test and can only break the
+    harness."""
+    if not ref:
+        return False
+    if ref.startswith((".", "/", "path:")):
+        return True
+    m = re.match(r"github:[^/]+/([^/?#]+)", ref)
+    return bool(m) and m.group(1) in WORKSPACE_PINS
+
+
+def _workspace_override_flags(ref, workdir):
+    """Build the --override-input set that pins `ref`'s inputs to the workspace
+    snapshot.
+
+    Overrides only the SHALLOWEST path at which each workspace repo appears,
+    and never a path nested under an already-overridden ancestor: overriding an
+    input makes nix re-resolve that subtree from the pinned repo's own lock, so
+    deeper occurrences are inherited. Forcing every path instead re-enters flake
+    resolution everywhere and resurrects dependency cycles the repos' own locks
+    had already cut ("error: found circular import of flake ...").
+    """
+    key = (ref, workdir if ref.startswith((".", "/", "path:")) else None)
+    if key in _WS_FLAGS_CACHE:
+        return _WS_FLAGS_CACHE[key]
+
+    flags = ""
+    try:
+        proc = subprocess.run(
+            ["nix", "flake", "metadata", "--json", ref],
+            cwd=workdir, capture_output=True, text=True, timeout=600,
+        )
+        if proc.returncode == 0:
+            locks = json.loads(proc.stdout)["locks"]
+            nodes, root = locks["nodes"], locks["root"]
+            chosen, queue, seen = {}, collections.deque([(root, "")]), set()
+            while queue:                       # BFS => first hit is shallowest
+                node, path = queue.popleft()
+                if node in seen:
+                    continue
+                seen.add(node)
+                for name, edge in (nodes.get(node, {}).get("inputs") or {}).items():
+                    if isinstance(edge, list):        # a `follows` edge
+                        continue
+                    sub = f"{path}/{name}" if path else name
+                    if any(sub.startswith(p + "/") for p in chosen.values()):
+                        continue
+                    locked = nodes.get(edge, {}).get("locked") or {}
+                    repo, rev = locked.get("repo"), locked.get("rev")
+                    if (repo in WORKSPACE_PINS and repo not in chosen and rev
+                            and rev != WORKSPACE_PINS[repo]["rev"]):
+                        chosen[repo] = sub
+                    queue.append((edge, sub))
+            parts = []
+            for repo, path in sorted(chosen.items(), key=lambda kv: kv[1]):
+                pin = WORKSPACE_PINS[repo]
+                parts += ["--override-input", path,
+                          f"github:{pin['owner']}/{repo}/{pin['rev']}"]
+            flags = " ".join(parts)
+        else:
+            print(f"        {yellow('workspace pins: nix flake metadata failed for ' + ref)}")
+    except Exception as e:
+        print(f"        {yellow('workspace pins: could not resolve ' + ref + f': {e}')}")
+
+    _WS_FLAGS_CACHE[key] = flags
+    return flags
+
+
+_GIT_CLONE_RE = re.compile(
+    r"\bgit\s+clone\b[^\n]*?(?:https://github\.com/|git@github\.com:)"
+    r"[^/\s]+/([^/\s]+?)(?:\.git)?(?=\s|$)")
+
+
+def pin_git_clones(cmd):
+    """Check a cloned workspace repo out at the snapshot's commit.
+
+    Several specs `git clone` a sibling repo (the UI a module is driven
+    through, a sample module to install). That is a plain git URL, not a flake
+    ref, so neither {release} nor --override-input touches it: the clone always
+    lands on the default branch, whatever it happens to be today. Under
+    --workspace-pins, follow it with a fetch+detach onto the pinned commit so
+    the clone matches the rest of the snapshot.
+
+    No-op when the repo is not in the pin map, and when no pins are loaded.
+    """
+    if not WORKSPACE_PINS:
+        return cmd
+    m = _GIT_CLONE_RE.search(cmd)
+    if not m:
+        return cmd
+    repo = m.group(1)
+    pin = WORKSPACE_PINS.get(repo)
+    if not pin:
+        return cmd
+    rev = pin["rev"]
+    return (f"{cmd} && git -C {repo} fetch --depth 1 origin {rev} "
+            f"&& git -C {repo} checkout --detach FETCH_HEAD")
+
+
+def inject_nix_overrides(cmd, override_flags, workdir=None):
+    """Append nix override flags to nix build/run/develop commands.
+
+    Two sources, both optional: the spec's own `build_overrides` (local paths)
+    and, when --workspace-pins is in play, a generated set that pins the target
+    flake's inputs to the workspace snapshot. The latter is what makes a
+    doc-test honour the workspace's pins instead of the cloned repo's own
+    flake.lock -- nix resolves a foreign repo flake from ITS committed lock,
+    so the workspace's `follows` never reach it otherwise.
+    """
+    ref = _installable_of(cmd)
+    if ref is None:
+        return pin_git_clones(cmd)
+    extra = []
+    if override_flags:
+        extra.append(override_flags)
+    if WORKSPACE_PINS and _is_workspace_scoped(ref):
+        ws = _workspace_override_flags(ref, workdir)
+        if ws:
+            extra.append(ws)
+    return f"{cmd} {' '.join(extra)}" if extra else cmd
 
 
 # ── Command Execution ─────────────────────────────────────────────────────────
@@ -401,7 +575,7 @@ def _exec_run(cmd, title, workdir, results, verbose, override_flags,
               expect_contains=None, step=None):
     """Execute a single run command with optional output assertions."""
     cmd = expand_vars(cmd)
-    cmd = inject_nix_overrides(cmd, override_flags)
+    cmd = inject_nix_overrides(cmd, override_flags, workdir)
     expect_contains = expect_contains or []
 
     rc, output = run_cmd(cmd, workdir, verbose, capture=True)
@@ -491,7 +665,7 @@ def handle_logoscore(section, workdir, results, verbose, override_flags,
         print("  -- Setup --")
         for cmd in setup_cmds:
             cmd = expand_vars(cmd)
-            cmd = inject_nix_overrides(cmd, override_flags)
+            cmd = inject_nix_overrides(cmd, override_flags, workdir)
             rc, output = run_cmd(cmd, workdir, verbose, capture=verbose)
             if rc != 0:
                 results.fail(f"logoscore setup: {cmd}", "setup command failed")
@@ -590,7 +764,7 @@ def handle_basecamp(section, workdir, results, verbose, override_flags,
     if install_as:
         print("  Building install package...")
         cmd = f"nix build '.#install' -o result-install"
-        cmd = inject_nix_overrides(cmd, override_flags)
+        cmd = inject_nix_overrides(cmd, override_flags, workdir)
         rc, _ = run_cmd(cmd, workdir, verbose)
         if rc == 0:
             if install_as == "core":
@@ -897,7 +1071,7 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
     # Run setup commands
     for cmd in ui_spec.get("setup", []):
         cmd = expand_vars(cmd)
-        cmd = inject_nix_overrides(cmd, override_flags)
+        cmd = inject_nix_overrides(cmd, override_flags, workdir)
         print(f"  Setup: {cmd}")
         rc, _ = run_cmd(cmd, workdir, verbose)
         if rc != 0:
@@ -929,7 +1103,7 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
     if launch_cmd:
         # Launch mode: start app in background, run tests against it, kill it
         launch_cmd = expand_vars(launch_cmd)
-        launch_cmd = inject_nix_overrides(launch_cmd, override_flags)
+        launch_cmd = inject_nix_overrides(launch_cmd, override_flags, workdir)
 
         env = {
             **os.environ,
@@ -1033,7 +1207,7 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
         build_cmd = ui_spec.get("build", "")
         if build_cmd:
             build_cmd = expand_vars(build_cmd)
-            build_cmd = inject_nix_overrides(build_cmd, override_flags)
+            build_cmd = inject_nix_overrides(build_cmd, override_flags, workdir)
             print(f"  Build: {build_cmd}")
             rc, _ = run_cmd(build_cmd, workdir, verbose)
             if rc != 0:
@@ -1155,6 +1329,8 @@ def _run_single_spec(spec, spec_path, workdir, args, results):
     set_release(release, release_overrides)
 
     override_flags = parse_build_overrides(spec, spec_dir)
+    if getattr(args, "workspace_pins", None):
+        load_workspace_pins(args.workspace_pins)
     module_name = find_module_name(spec)
 
     tutorial_name = spec.get("name", "doctest")
@@ -1172,6 +1348,9 @@ def _run_single_spec(spec, spec_path, workdir, args, results):
         print(f"  pins     : {pins}")
     if override_flags:
         print(f"  overrides: {override_flags}")
+    if WORKSPACE_PINS:
+        print(f"  ws pins  : {len(WORKSPACE_PINS)} repos "
+              f"(nix inputs forced to the workspace snapshot)")
     print()
 
     if _REPORT:
@@ -2528,6 +2707,15 @@ def main():
                             help="Pin one repo's {release} to a git tag or commit "
                                  "hash, e.g. --release-for logos-logoscore-cli=abc123 "
                                  "(repeatable; overrides --release for that repo)")
+    run_parser.add_argument("--workspace-pins", default=None, metavar="PATH",
+                            help="JSON map {repo: {owner, rev}} of a workspace "
+                                 "snapshot. Every nix build/run/develop of a "
+                                 "workspace repo (or a local path) gets "
+                                 "--override-input flags pinning its inputs to "
+                                 "that snapshot, instead of resolving the target "
+                                 "repo's own committed flake.lock. Rebuilds a lot "
+                                 "-- intended for the logos-workspace "
+                                 "tests-and-doctests job, not everyday runs.")
     run_parser.add_argument("--report", default=None, metavar="PATH",
                             help="Write a two-column HTML report (rendered docs + "
                                  "the commands actually run and their output) to PATH")
