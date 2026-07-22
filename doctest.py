@@ -453,7 +453,7 @@ def _workspace_override_flags(ref, workdir):
 
 _GIT_CLONE_RE = re.compile(
     r"\bgit\s+clone\b[^\n]*?(?:https://github\.com/|git@github\.com:)"
-    r"[^/\s]+/([^/\s]+?)(?:\.git)?(?=\s|$)")
+    r"[^/\s'\"]+/([^/\s'\"]+?)(?:\.git)?(?=[\s'\"]|$)")
 
 
 def pin_git_clones(cmd):
