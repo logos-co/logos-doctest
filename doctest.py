@@ -482,6 +482,127 @@ def pin_git_clones(cmd):
             f"&& git -C {repo} checkout --detach FETCH_HEAD")
 
 
+_HEREDOC_RE = re.compile(r"<<(?P<dash>-?)\s*(?P<q>['\"]?)(?P<word>[A-Za-z_][A-Za-z_0-9]*)(?P=q)")
+
+# Top-level separators that end one command within a `run:` block. Order
+# matters: the two-character forms must be tried before their prefixes.
+_SHELL_SEPARATORS = ("&&", "||", "|&", ";;", ";", "|", "&", "\n")
+
+
+def split_shell_segments(cmd):
+    """Split `cmd` into (segment, separator) pairs at top-level shell
+    separators, leaving quoted strings, escapes, command substitutions and
+    heredoc bodies untouched.
+
+    Lossless: "".join(seg + sep for seg, sep in split_shell_segments(c)) == c.
+
+    A `run:` block is frequently several commands — `nix build ...` on one line
+    and `cp`/`cd` on the next — so anything that rewrites "the command" has to
+    know where each one ends. Redirections are the fiddly part: the `&` in
+    `2>&1` and the `|` in `>|` are not separators.
+    """
+    out, seg = [], []
+    i, n = 0, len(cmd)
+    quote = None          # ' or " while inside a quoted string
+    depth = 0             # ( ) / $( ) / ` ` nesting
+    backtick = False      # inside a `...` substitution
+    pending_heredocs = []  # (terminator, strip_tabs) awaiting their body
+
+    def flush(sep):
+        out.append(("".join(seg), sep))
+        seg.clear()
+
+    while i < n:
+        ch = cmd[i]
+
+        if quote:
+            seg.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                seg.append(cmd[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+
+        if ch == "\\" and i + 1 < n:          # escape, incl. line continuation
+            seg.append(ch)
+            seg.append(cmd[i + 1])
+            i += 2
+            continue
+
+        if ch in "'\"":
+            quote = ch
+            seg.append(ch)
+            i += 1
+            continue
+
+        # Group nesting: subshells `( ... )`, command substitution `$( ... )`
+        # and backticks. Separators inside a group belong to the group, so the
+        # whole thing stays one segment (and `(cd x && nix build ...)` can be
+        # descended into rather than appended after).
+        if ch == "`":
+            depth += -1 if backtick else 1
+            backtick = not backtick
+            seg.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            seg.append(ch)
+            i += 1
+            continue
+        if ch == ")" and depth:
+            depth -= 1
+            seg.append(ch)
+            i += 1
+            continue
+
+        if cmd.startswith("<<", i) and not cmd.startswith("<<<", i):
+            m = _HEREDOC_RE.match(cmd, i)
+            if m:
+                pending_heredocs.append((m.group("word"), bool(m.group("dash"))))
+                seg.append(m.group(0))
+                i = m.end()
+                continue
+
+        # A newline with heredocs pending starts their bodies: copy verbatim up
+        # to and including each terminator line, never splitting inside them.
+        if ch == "\n" and pending_heredocs:
+            seg.append(ch)
+            i += 1
+            while pending_heredocs:
+                word, dash = pending_heredocs.pop(0)
+                while i < n:
+                    j = cmd.find("\n", i)
+                    line = cmd[i:j if j != -1 else n]
+                    seg.append(line)
+                    if j != -1:
+                        seg.append("\n")
+                    i = (j + 1) if j != -1 else n
+                    if (line.strip() if dash else line.rstrip("\n")) == word:
+                        break
+            continue
+
+        if depth == 0:
+            sep = next((s for s in _SHELL_SEPARATORS if cmd.startswith(s, i)), None)
+            # `2>&1`, `&>log`, `>|file` — redirection operators, not separators.
+            if sep in ("&", "|") and (
+                    (i and cmd[i - 1] == ">") or cmd[i + 1:i + 2] == ">"):
+                sep = None
+            if sep:
+                flush(sep)
+                i += len(sep)
+                continue
+
+        seg.append(ch)
+        i += 1
+
+    flush("")
+    return out
+
+
 def inject_nix_overrides(cmd, override_flags, workdir=None):
     """Append nix override flags to nix build/run/develop commands.
 
@@ -491,29 +612,124 @@ def inject_nix_overrides(cmd, override_flags, workdir=None):
     doc-test honour the workspace's pins instead of the cloned repo's own
     flake.lock -- nix resolves a foreign repo flake from ITS committed lock,
     so the workspace's `follows` never reach it otherwise.
+
+    Flags go on the nix command itself, not at the end of the `run:` block. A
+    block whose nix build is followed by another line used to come out as
+
+        nix build 'path:./mod#lgx' -o out
+        cp -RL out/. ./modules/ --override-input logos-protocol github:...
+
+    which either fed the flags to the wrong program (`cd: too many arguments`)
+    or, when the block ended in a newline, left them starting a line of their
+    own (`--override-input: command not found`). Both were pure harness noise
+    that failed the step before the spec's own commands ever ran.
     """
-    cmd = pin_git_clones(cmd)
-    extra = []
+    return _inject_into_block(pin_git_clones(cmd), override_flags, workdir)
 
-    # Spec-level build_overrides keep their long-standing "the command mentions
-    # a nix subcommand, so append" semantics — documented and self-tested in
-    # doctests/05-more-spec-features.test.yaml, which asserts injection into
-    # `echo 'nix build .#demo'`. (Widened from `nix build` only: it never
-    # reached `nix run` launches, i.e. every ui_test, or `nix develop`.)
-    if override_flags and _NIX_SUBCMD_RE.search(cmd):
-        extra.append(override_flags)
 
-    # Workspace pinning needs the actual installable, so it is deliberately
-    # stricter: it must know WHICH flake to resolve before it can compute the
-    # override paths.
-    if WORKSPACE_PINS:
-        ref = _installable_of(cmd)
-        if ref and _is_workspace_scoped(ref):
-            ws = _workspace_override_flags(ref, workdir)
-            if ws:
-                extra.append(ws)
+_SUBSHELL_RE = re.compile(r"^(?P<pre>\s*)\((?P<inner>.*)\)(?P<post>\s*)$", re.S)
 
-    return f"{cmd} {' '.join(extra)}" if extra else cmd
+
+def _split_substitutions(seg):
+    """Yield (text, is_substitution) chunks, splitting balanced `$( ... )`
+    spans. Quote-aware, so `echo '$(nix build)'` stays literal text."""
+    chunks, buf = [], []
+    i, n, quote = 0, len(seg), None
+    while i < n:
+        ch = seg[i]
+        if quote:
+            buf.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                buf.append(seg[i + 1]); i += 2; continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            buf.extend(seg[i:i + 2]); i += 2; continue
+        if ch in "'\"":
+            quote = ch; buf.append(ch); i += 1; continue
+        if seg.startswith("$(", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if seg[j] == "(":
+                    depth += 1
+                elif seg[j] == ")":
+                    depth -= 1
+                j += 1
+            if depth == 0:                      # balanced: j is past the ')'
+                chunks.append(("".join(buf), False)); buf = []
+                chunks.append((seg[i + 2:j - 1], True))
+                i = j
+                continue
+        buf.append(ch)
+        i += 1
+    chunks.append(("".join(buf), False))
+    return chunks
+
+
+def _inject_into_block(block, override_flags, workdir):
+    """Inject into every nix command inside one shell block."""
+    out = []
+
+    for seg, sep in split_shell_segments(block):
+        # `OUT=$(nix build .#x --print-out-paths)` — flags appended after the
+        # closing paren would parse, then run as their own command with OUT= as
+        # an environment assignment. Inject inside the substitution instead,
+        # and judge the tail on what is left outside it.
+        chunks = _split_substitutions(seg)
+        if any(is_sub and _NIX_SUBCMD_RE.search(text) for text, is_sub in chunks):
+            seg = "".join(
+                f"$({_inject_into_block(text, override_flags, workdir)})" if is_sub
+                else text
+                for text, is_sub in chunks)
+            outside = "".join(t for t, is_sub in chunks if not is_sub)
+            if not _NIX_SUBCMD_RE.search(outside):
+                out.append(seg + sep)
+                continue
+
+        # `(cd mod && nix build .#lgx -o ../out)` — a subshell is one segment,
+        # and flags appended AFTER its `)` are a syntax error, so descend.
+        m = _SUBSHELL_RE.match(seg)
+        if m and _NIX_SUBCMD_RE.search(m.group("inner")):
+            inner = _inject_into_block(m.group("inner"), override_flags, workdir)
+            out.append(f"{m.group('pre')}({inner}){m.group('post')}{sep}")
+            continue
+
+        extra = []
+
+        # Spec-level build_overrides keep their long-standing "the command
+        # mentions a nix subcommand, so append" semantics — documented and
+        # self-tested in doctests/05-more-spec-features.test.yaml, which
+        # asserts injection into `echo 'nix build .#demo'`. (Widened from
+        # `nix build` only: it never reached `nix run` launches, i.e. every
+        # ui_test, or `nix develop`.)
+        if override_flags and _NIX_SUBCMD_RE.search(seg):
+            extra.append(override_flags)
+
+        # Workspace pinning needs the actual installable, so it is deliberately
+        # stricter: it must know WHICH flake to resolve before it can compute
+        # the override paths. Resolved per segment, so a block that builds two
+        # different flakes pins each against its own lock.
+        if WORKSPACE_PINS and _NIX_SUBCMD_RE.search(seg):
+            ref = _installable_of(seg)
+            if ref and _is_workspace_scoped(ref):
+                ws = _workspace_override_flags(ref, workdir)
+                if ws:
+                    extra.append(ws)
+
+        if extra:
+            # Keep trailing whitespace outside the flags, and note that a
+            # backgrounding `&` is a SEPARATOR here, so it already sits in
+            # `sep` — the flags land on the command, not after the `&` where
+            # they used to run as a command of their own.
+            body = seg.rstrip()
+            trailing = seg[len(body):]
+            seg = f"{body} {' '.join(extra)}{trailing}"
+
+        out.append(seg + sep)
+
+    return "".join(out)
 
 
 # ── Command Execution ─────────────────────────────────────────────────────────
