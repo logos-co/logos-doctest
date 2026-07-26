@@ -630,6 +630,45 @@ def inject_nix_overrides(cmd, override_flags, workdir=None):
 _SUBSHELL_RE = re.compile(r"^(?P<pre>\s*)\((?P<inner>.*)\)(?P<post>\s*)$", re.S)
 
 
+def _spec_override_paths(seg):
+    """Input paths the command already overrides itself."""
+    try:
+        toks = shlex.split(seg)
+    except ValueError:
+        toks = seg.replace("'", " ").replace('"', " ").split()
+    return {toks[i + 1] for i, t in enumerate(toks)
+            if t == "--override-input" and i + 1 < len(toks)}
+
+
+def _drop_overridden(ws_flags, seg):
+    """Drop workspace pins the command already pins itself, or that nest under
+    one of its overrides.
+
+    _workspace_override_flags() keeps its own set free of paths nested under an
+    already-overridden ancestor, because forcing both re-enters flake
+    resolution and resurrects cycles the repos' locks had cut. Specs that
+    hand-write `--override-input` (logos-cpp-sdk's do, for five inputs each)
+    need the same treatment: layering a generated pin on top of a spec's own
+    one is exactly that case, and nix answers with
+
+        error: found circular import of flake 'github:logos-co/logos-module-builder/...'
+
+    The spec's explicit override wins — it is testing that checkout on purpose.
+    """
+    if not ws_flags:
+        return ws_flags
+    existing = _spec_override_paths(seg)
+    if not existing:
+        return ws_flags
+    parts, kept = ws_flags.split(), []
+    for i in range(0, len(parts) - 2, 3):
+        path = parts[i + 1]
+        if any(path == p or path.startswith(p + "/") for p in existing):
+            continue
+        kept += parts[i:i + 3]
+    return " ".join(kept)
+
+
 def _split_substitutions(seg):
     """Yield (text, is_substitution) chunks, splitting balanced `$( ... )`
     spans. Quote-aware, so `echo '$(nix build)'` stays literal text."""
@@ -714,7 +753,7 @@ def _inject_into_block(block, override_flags, workdir):
         if WORKSPACE_PINS and _NIX_SUBCMD_RE.search(seg):
             ref = _installable_of(seg)
             if ref and _is_workspace_scoped(ref):
-                ws = _workspace_override_flags(ref, workdir)
+                ws = _drop_overridden(_workspace_override_flags(ref, workdir), seg)
                 if ws:
                     extra.append(ws)
 
