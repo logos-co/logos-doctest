@@ -187,6 +187,45 @@ sections:
           (e.g. `../logos-cpp-sdk`) so `nix build` resolves against your local
           code; `generate` would still render the plain `nix build .#demo`.
 
+      - title: "Where the flags land in a multi-command step"
+        text: |
+          A `run:` block is often several commands — a build, then a `cp` that
+          stages its result. The flags belong to the **nix command**, not to the
+          end of the block, so this spec runs a build line followed by a `cd`
+          line and asserts both survive. Appending to the block instead would
+          hand the flags to `cd` (`cd: too many arguments`) or, when the block
+          ends in a newline, leave them starting a line of their own
+          (`--override-input: command not found`) — the step would fail before
+          any of its own commands ran.
+        file:
+          path: overrides-multiline.test.yaml
+          language: yaml
+          content: |
+            name: "build_overrides placement"
+            output: obm.md
+            build_overrides:
+              logos-cpp-sdk: ./fake-sdk
+            sections:
+              - title: "A multi-command step"
+                step: true
+                steps:
+                  - title: "A nix line, then a plain one"
+                    run: |
+                      echo 'nix build .#demo'
+                      cd .
+                    expect_contains:
+                      - "--override-input logos-cpp-sdk"
+
+      - title: "Run it — the following command is left alone"
+        run: "nix run github:logos-co/logos-doctest{release} -- run overrides-multiline.test.yaml --verbose"
+        code_block: "doctest run overrides-multiline.test.yaml --verbose"
+        expect_contains:
+          - "--override-input logos-cpp-sdk"
+          - "1 passed, 0 failed"
+        post_text: |
+          The `cd .` runs untouched, and the flags sit on the echo line where the
+          `nix build` mention is.
+
   - title: "--workspace-pins: build against a multi-repo snapshot"
     step: true
     text: |
