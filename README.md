@@ -137,6 +137,13 @@ When a run includes multiple specs, the report's tutorial picker is deep-linkabl
 append `#<tutorial-slug>` to the report URL (slug = lowercase name with non-alphanumerics
 replaced by hyphens) to open a specific tutorial directly.
 
+Every heading in the report also gets a GitHub-style permalink: hover a title or
+subtitle and a 🔗 icon appears in the left gutter. Clicking it copies the full deep
+link (`#<tutorial-slug>/<heading-slug>`) to the clipboard and jumps to that heading —
+so a CI report published to GitHub Pages can be linked straight at the step under
+discussion. Opening such a link selects the right tutorial, scrolls to the heading,
+and briefly highlights it.
+
 ## Watching it live (`--tui`)
 
 `--tui` runs the same two-column view live in your terminal instead of writing a

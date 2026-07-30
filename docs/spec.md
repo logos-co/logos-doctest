@@ -552,6 +552,8 @@ It records every executed action type:
 
 The dropdown at the top of the report switches between specs. It is populated whenever the report holds more than one spec, which happens two ways: a `requires:` chain (every tutorial in the chain is included), or passing **several specs to one `run`** (`doctest run a.test.yaml b.test.yaml --report out.html`). The latter is how a repo with multiple independent `*.test.yaml` files publishes a single combined CI report — one dropdown entry per spec — instead of a separate HTML file each. Markdown is rendered client-side via [marked.js](https://marked.js.org/) loaded from a CDN, so viewing the report needs network access on first open.
 
+Headings inside the report are permalinked the way GitHub renders markdown headings: each rendered `h1`–`h6` (and the tutorial title) gets a slug `id` and a link icon in the left gutter that appears on hover or keyboard focus. Clicking it copies `…/report.html#<tutorial-slug>/<heading-slug>` to the clipboard and navigates there; duplicate heading text is disambiguated with `-2`, `-3`, … suffixes. Loading such a URL selects the tutorial, scrolls the heading clear of the sticky header, and flashes it once. Plain `#<tutorial-slug>` (or `#<index>`) links from before still work.
+
 Pair `--report` with `--continue-on-fail` so the report captures the full run rather than stopping at the first failure. The CI workflow ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs with `--report` and publishes the result to GitHub Pages, linked from a PR comment.
 
 ### Live TUI (`--tui` / `--iterative`)

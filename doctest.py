@@ -2400,6 +2400,31 @@ _REPORT_HTML_TEMPLATE = r"""<!DOCTYPE html>
   pre.cmd, pre.output { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.45; }
   .empty { color: var(--muted); font-style: italic; font-size: 12.5px; }
   details summary { cursor: pointer; color: var(--accent); font-size: 12px; margin-bottom: 4px; }
+  /* GitHub-style permalinks: every heading carries a link icon in the left
+     gutter (revealed on hover/focus) that copies a deep link to that section.
+     scroll-margin-top keeps the target clear of the sticky header. */
+  .heading-anchored { position: relative; scroll-margin-top: 76px; }
+  a.anchor {
+    position: absolute; left: -18px; top: 0; width: 16px; height: 1.55em;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--muted); opacity: 0; text-decoration: none;
+    transition: opacity .1s ease-in;
+  }
+  a.anchor svg { width: 14px; height: 14px; display: block; }
+  .heading-anchored:hover > a.anchor, a.anchor:focus { opacity: 1; }
+  a.anchor:hover { color: var(--accent); }
+  .heading-anchored.flash { animation: flash 1.4s ease-out; border-radius: 4px; }
+  @keyframes flash {
+    from { background: rgba(88,166,255,.28); box-shadow: 0 0 0 4px rgba(88,166,255,.28); }
+    to { background: transparent; box-shadow: 0 0 0 4px transparent; }
+  }
+  #toast {
+    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 7px 14px; font-size: 12.5px; z-index: 20;
+    opacity: 0; pointer-events: none; transition: opacity .15s ease-in-out;
+  }
+  #toast.show { opacity: 1; }
 </style>
 </head>
 <body>
@@ -2411,6 +2436,7 @@ _REPORT_HTML_TEMPLATE = r"""<!DOCTYPE html>
   </label>
 </header>
 <main id="main"></main>
+<div id="toast" role="status" aria-live="polite"></div>
 
 <script id="report-data" type="application/json">__DATA__</script>
 <script>
@@ -2490,27 +2516,142 @@ _REPORT_HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
       main.appendChild(div);
     });
+
+    addAnchors(main, slug(t.meta.name));
   }
 
   function slug(s) {
     return String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
   }
-  function indexFromHash() {
-    const raw = decodeURIComponent(location.hash.replace(/^#/, ""));
-    if (!raw) return 0;
-    if (/^\d+$/.test(raw) && +raw < DATA.tutorials.length) return +raw;
-    const i = DATA.tutorials.findIndex(
-      t => slug(t.meta.name) === raw || t.meta.name === raw
+
+  // Octicon "link" — the same glyph GitHub puts next to markdown headings.
+  const LINK_ICON =
+    '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d=' +
+    '"M7.775 3.275a.75.75 0 0 0 1.06 1.06l1.25-1.25a2 2 0 1 1 2.83 2.83l-2.5 2.5a2 2 0 0 1-2.83 0 ' +
+    '.75.75 0 0 0-1.06 1.06 3.5 3.5 0 0 0 4.95 0l2.5-2.5a3.5 3.5 0 0 0-4.95-4.95l-1.25 1.25Zm-4.69 ' +
+    '9.64a2 2 0 0 1 0-2.83l2.5-2.5a2 2 0 0 1 2.83 0 .75.75 0 0 0 1.06-1.06 3.5 3.5 0 0 0-4.95 0l-2.5 ' +
+    '2.5a3.5 3.5 0 0 0 4.95 4.95l1.25-1.25a.75.75 0 0 0-1.06-1.06l-1.25 1.25a2 2 0 0 1-2.83 0Z"></path></svg>';
+
+  // Give every heading a stable slug id (deduplicated the way GitHub does, with
+  // -1/-2 suffixes) and a permalink whose href is "#<tutorial>/<heading>".
+  function addAnchors(container, tutSlug) {
+    const used = new Map();
+    const nodes = container.querySelectorAll(
+      ".tutorial-title, .md h1, .md h2, .md h3, .md h4, .md h5, .md h6"
     );
-    return i >= 0 ? i : 0;
+    nodes.forEach(node => {
+      const text = node.textContent.trim();
+      const isTitle = node.classList.contains("tutorial-title");
+      let href = "#" + tutSlug;
+      if (!isTitle) {
+        const base = slug(text) || "section";
+        const n = (used.get(base) || 0) + 1;
+        used.set(base, n);
+        node.id = n > 1 ? base + "-" + n : base;
+        href += "/" + node.id;
+      }
+      node.classList.add("heading-anchored");
+      const a = document.createElement("a");
+      a.className = "anchor";
+      a.href = href;
+      a.title = "Copy link to this section";
+      a.setAttribute("aria-label", "Permalink: " + text);
+      a.innerHTML = LINK_ICON;
+      node.insertBefore(a, node.firstChild);
+    });
   }
-  function show(idx) { picker.value = idx; render(idx); }
+
+  let toastTimer = null;
+  function toast(msg) {
+    const el = document.getElementById("toast");
+    el.textContent = msg;
+    el.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove("show"), 1600);
+  }
+
+  // navigator.clipboard needs a secure context; reports are often opened over
+  // file://, so fall back to the old execCommand path there.
+  function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(
+        () => toast("Link copied"),
+        () => toast(text)
+      );
+      return;
+    }
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    toast(ok ? "Link copied" : text);
+  }
+
+  function scrollToId(id) {
+    if (!id) { window.scrollTo(0, 0); return; }
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.scrollIntoView({ block: "start" });
+    el.classList.remove("flash");
+    void el.offsetWidth;  // restart the animation on a repeat click
+    el.classList.add("flash");
+  }
+
+  document.addEventListener("click", ev => {
+    const a = ev.target.closest && ev.target.closest("a.anchor");
+    if (!a) return;
+    ev.preventDefault();
+    const href = a.getAttribute("href");
+    copyText(location.href.split("#")[0] + href);
+    if (location.hash === href) scrollToId(a.parentNode.id);
+    else location.hash = href;  // hashchange scrolls
+  });
+
+  // "#<tutorial>" (name, slug, or index) optionally followed by "/<heading>".
+  function parseHash() {
+    const raw = decodeURIComponent(location.hash.replace(/^#/, ""));
+    if (!raw) return { idx: 0, frag: "" };
+    const cut = raw.indexOf("/");
+    const tut = cut >= 0 ? raw.slice(0, cut) : raw;
+    const frag = cut >= 0 ? raw.slice(cut + 1) : "";
+    if (/^\d+$/.test(tut) && +tut < DATA.tutorials.length) return { idx: +tut, frag };
+    const i = DATA.tutorials.findIndex(
+      t => slug(t.meta.name) === tut || t.meta.name === tut
+    );
+    if (i >= 0) return { idx: i, frag };
+    // No tutorial matched: treat a bare hash as a heading in the current one.
+    return { idx: currentIdx >= 0 ? currentIdx : 0, frag: cut >= 0 ? frag : raw };
+  }
+
+  let currentIdx = -1;
+  function show(idx, frag) {
+    if (idx !== currentIdx) {
+      picker.value = idx;
+      render(idx);
+      currentIdx = idx;
+    }
+    if (frag) requestAnimationFrame(() => scrollToId(frag));
+  }
   picker.addEventListener("change", () => {
     location.hash = slug(DATA.tutorials[+picker.value].meta.name);
-    render(+picker.value);
+    show(+picker.value);
   });
-  window.addEventListener("hashchange", () => show(indexFromHash()));
-  show(indexFromHash());
+  window.addEventListener("hashchange", () => {
+    const h = parseHash();
+    show(h.idx, h.frag);
+  });
+  const initial = parseHash();
+  show(initial.idx, initial.frag);
+  // Inlined screenshots have no intrinsic size until decoded, so the first
+  // scroll can land short; re-anchor once everything has loaded.
+  if (initial.frag) {
+    window.addEventListener("load", () => scrollToId(initial.frag), { once: true });
+  }
 </script>
 </body>
 </html>
