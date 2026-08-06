@@ -911,7 +911,7 @@ def _app_warm_installables(launch_cmd, workdir, verbose=False, timeout=None):
 
     if fragment.startswith("apps."):
         attr = fragment                       # already a full app attr path
-    elif re.fullmatch(r"[A-Za-z0-9_.-]*", fragment) and "." not in fragment:
+    elif re.fullmatch(r"[A-Za-z0-9_-]*", fragment):
         system = _nix_system()
         if not system:
             return None
@@ -1532,14 +1532,13 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
             if targets:
                 warm_cmd = "nix build --no-link -L " + " ".join(
                     shlex.quote(t) for t in targets)
-                print(f"  Pre-building app (apps output of: {launch_cmd})")
+                print(f"  Pre-building app: {warm_cmd}")
+                print(f"        {dim('(the apps output of: ' + launch_cmd + ')')}")
             else:
                 warm_cmd = "nix build" + launch_cmd.lstrip()[len("nix run"):]
                 if " -L" not in warm_cmd:
                     warm_cmd += " -L"
                 print(f"  Pre-building app: {warm_cmd}")
-            if verbose:
-                print(f"        {dim(warm_cmd)}")
             wrc, _ = run_cmd(warm_cmd, workdir, verbose, timeout=build_timeout)
             if wrc != 0:
                 print(f"        {yellow('pre-build returned non-zero; launching anyway')}")
