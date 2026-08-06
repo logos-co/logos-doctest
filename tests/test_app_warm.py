@@ -15,6 +15,15 @@ The fixture flakes below reproduce exactly that shape with no toolchain: their
 ever BUILT here — the resolver only has to evaluate — so these tests need nix
 but no nixpkgs, no network, and no Qt.
 
+Two invariants are guarded, and they pull in opposite directions:
+
+  * a launch shape that CAN resolve must keep resolving. Every fallback is a
+    silent return to the original wrong-target bug, so a guard that pushes
+    valid specs into it is the bug wearing a different hat.
+  * a resolve is only trusted when it comes back as a derivation. Trusting a
+    non-derivation warms something unbuildable, which is worse than the
+    fallback it displaces (see ResolvedTargetMustBeADerivation).
+
 Run with:  nix develop .# --command python3 tests/test_app_warm.py
 """
 
@@ -62,6 +71,11 @@ FLAKE_WITH_APP = """{
         default = {
           type = "app";
           program = "${mk system "warm-fixture-app"}/bin/run-app";
+        };
+        # A named app, the `nix run REF#group` shape the chat-ui specs use.
+        alt = {
+          type = "app";
+          program = "${mk system "warm-fixture-alt"}/bin/run-alt";
         };
       });
     };
@@ -205,9 +219,14 @@ class LaunchFlagsSurviveTheShell(FlakeFixtureMixin, unittest.TestCase):
     The resolve runs through a shell, but `flags` arrive already split by
     shlex. Re-joining them raw lets one flag value become several argv
     entries; nix then rejects the surplus positional, the resolve fails, and
-    the caller silently degrades to the plain `nix build` rewrite — which is
-    exactly the wrong-target bug this whole module exists to prevent. A
-    fallback is invisible in the log, so only a test catches it.
+    the caller degrades to the plain `nix build` rewrite — which is exactly
+    the wrong-target bug this whole module exists to prevent.
+
+    That degradation is easy to miss rather than invisible: it still prints a
+    `Pre-building app:` line, just naming the flake ref instead of a `.drv^*`
+    and without the `(the apps output of: …)` continuation, and it only says
+    why under `--verbose` (`no app attribute at …; warming the package
+    instead`). Nothing fails, so a test is what actually catches it.
     """
 
     @classmethod
@@ -240,8 +259,23 @@ class LaunchFlagsSurviveTheShell(FlakeFixtureMixin, unittest.TestCase):
         self.assertIn("warm-fixture-app", targets[0])
 
     def test_flag_values_are_not_evaluated_by_the_shell(self):
-        # A value is data. Re-joining raw would let the shell expand it, so
-        # the warm would resolve something the launch never asked for.
+        """A flag value is data to the resolve, and the warm does NOT expand it.
+
+        This locks in a deliberate asymmetry with the launch, which is worth
+        knowing before you write a spec that leans on it. The launch runs via
+        `subprocess(..., shell=True)`, so ITS flag values still go through the
+        shell; the resolve's do not. A launch flag that only means something
+        after expansion — `--override-input dep 'path:$DEPDIR'`, or a `~` —
+        therefore resolves to nothing (`nix eval` reports `path '…/$DEPDIR'
+        does not exist`), and the warm quietly falls back to the plain `nix
+        build` rewrite while the launch goes on to expand it.
+
+        That is the intended trade: expanding here would warm a target the
+        launch never named, which is a worse failure than warming the package.
+        Nothing in-tree depends on it — `expand_vars` handles only {ext},
+        {shared_flags} and {release}, and no `nix run` launch line in the
+        workspace carries a shell variable.
+        """
         d = self._write_flake(FLAKE_WITH_APP)
         marker = os.path.join(d, "SUBSTITUTED")
         targets = self._resolve(
@@ -251,6 +285,98 @@ class LaunchFlagsSurviveTheShell(FlakeFixtureMixin, unittest.TestCase):
             "the flag value was expanded by the shell instead of passed through")
         self.assertIsNotNone(targets)
         self.assertIn("warm-fixture-app", targets[0])
+
+
+class ResolvedTargetMustBeADerivation(FlakeFixtureMixin, unittest.TestCase):
+    """The resolve is only trusted when it comes back as a derivation.
+
+    `builtins.getContext` keys the derivations a string depends on, so a
+    successful resolve is all `.drv` and nothing else. A plain store path
+    coming back means the eval never ran our `--apply` and we are staring at
+    the raw program — which happens whenever a flag ahead of it swallows
+    `--apply` as one of its own values.
+
+    That result is truthy, so without a check the caller SKIPS the fallback and
+    warms a program path. On a cold store — the case this whole resolver exists
+    for — that path is not buildable at all ("don't know how to build these
+    paths"), so the warm does nothing and the launch pays the whole compile:
+    strictly worse than the fallback it displaced. What the log shows is a
+    `Pre-building app:` line naming something that is not a `.drv` followed by
+    `pre-build returned non-zero; launching anyway`, which reads like an
+    ordinary best-effort miss. (On a warm store it "succeeds" as a no-op and
+    there is no warning at all.)
+
+    Defence in depth rather than a live bug: every flag truncation that
+    produces this also makes the launch itself fail (`error: flag '--option'
+    requires 2 argument(s), but only 0 were given`), so no spec can reach it
+    today. The point is that the check is structural — it does not depend on
+    anyone having enumerated the flag that swallowed the `--apply`.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.system = dt._nix_system()
+        if not cls.system:
+            raise unittest.SkipTest("nix not available")
+
+    # `--option` takes two values; with none supplied it eats `--apply` and the
+    # expression, nix shrugs ("warning: unknown setting '--apply'"), and the
+    # eval succeeds without ever applying the function.
+    TRUNCATED = "--option"
+
+    def test_the_truncated_flag_really_does_defeat_the_apply(self):
+        """Not a tautology: the bad resolve exists and is a program path."""
+        d = self._write_flake(FLAKE_WITH_APP)
+        out = subprocess.run(
+            ["nix", "eval", "--raw",
+             f"path:{d}#apps.{self.system}.default.program",
+             self.TRUNCATED, "--apply", dt._APP_PROGRAM_CTX],
+            capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, "the eval is expected to SUCCEED")
+        got = out.stdout.strip()
+        self.assertTrue(got.startswith("/nix/store/"), got)
+        self.assertFalse(got.endswith(".drv"), f"expected a program path: {got}")
+        self.assertTrue(got.endswith("/bin/run-app"), got)
+
+    def test_that_program_path_is_not_buildable(self):
+        """...and warming it would have been a no-op, not a cheaper warm."""
+        d = self._write_flake(FLAKE_WITH_APP)
+        program = subprocess.run(
+            ["nix", "eval", "--raw",
+             f"path:{d}#apps.{self.system}.default.program"],
+            capture_output=True, text=True).stdout.strip()
+        # `substituters ''` keeps this hermetic and instant; the fixture
+        # derivation is never built, so the path cannot exist.
+        out = subprocess.run(
+            ["nix", "build", "--no-link", "--option", "substituters", "", program],
+            capture_output=True, text=True)
+        self.assertNotEqual(out.returncode, 0, "expected an unbuildable path")
+        self.assertIn("don't know how to build", out.stderr)
+
+    def test_a_non_derivation_resolve_falls_back(self):
+        """The guard: fall back, rather than warm something unbuildable."""
+        d = self._write_flake(FLAKE_WITH_APP)
+        self.assertIsNone(
+            dt._app_warm_installables(
+                f"nix run path:{d} {self.TRUNCATED}", os.getcwd()),
+            "a resolve that did not yield a derivation must fall back")
+
+    def test_every_resolved_target_is_a_derivation(self):
+        """The invariant, across the launch shapes real specs actually use."""
+        d = self._write_flake(FLAKE_WITH_APP)
+        for suffix in ("",                                  # nix run .
+                       "#alt",                              # nix run .#name
+                       f"#apps.{self.system}.default",      # explicit attr path
+                       " -- --height 1000",                 # app argv
+                       " --no-write-lock-file -- --height 2000",
+                       " -o result"):                       # build-only flag
+            with self.subTest(suffix=suffix):
+                sep = "" if suffix.startswith("#") else " "
+                targets = dt._app_warm_installables(
+                    f"nix run path:{d}{sep}{suffix}".strip(), os.getcwd())
+                self.assertIsNotNone(targets, "this shape must still resolve")
+                for t in targets:
+                    self.assertTrue(t.endswith(".drv^*"), t)
 
 
 if __name__ == "__main__":

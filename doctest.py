@@ -926,6 +926,18 @@ def _app_warm_installables(launch_cmd, workdir, verbose=False, timeout=None):
     # shell metacharacter splits into several argv entries, nix rejects the
     # extra positional, and the failed resolve degrades silently to the plain
     # `nix build` rewrite — reinstating the very bug this resolver fixes.
+    #
+    # Deliberate asymmetry, and the one thing to know before writing a spec that
+    # leans on it: the LAUNCH still goes through `subprocess(..., shell=True)`,
+    # so its flag values are shell-expanded, while this resolve's are not. A
+    # launch flag whose value only means something after expansion —
+    # `--override-input dep 'path:$DEPDIR'`, or a `~` — therefore resolves to
+    # nothing here, the resolve fails, and the warm quietly drops to the plain
+    # `nix build` rewrite (correct-ish, just not the app). Expansion is not
+    # added back because it would make the warm build a target the launch never
+    # named. Nothing in-tree relies on it: `expand_vars` handles only {ext},
+    # {shared_flags} and {release}, and no `nix run` launch line carries a
+    # shell variable. Spell such a value out, or set it via `build_overrides`.
     eval_cmd = " ".join([
         "nix eval --raw", shlex.quote(f"{ref}#{attr}.program"),
         *(shlex.quote(f) for f in flags),
@@ -941,9 +953,31 @@ def _app_warm_installables(launch_cmd, workdir, verbose=False, timeout=None):
     # take only the store paths the --apply produced.
     paths = [ln.strip() for ln in out.splitlines()
              if ln.strip().startswith("/nix/store/")]
-    if not paths:
+
+    # Every line must be a `.drv`, because that is all `builtins.getContext`
+    # can key: the derivations the program string depends on. A store path that
+    # is NOT a derivation means the eval did not run the `--apply` we asked for
+    # and we are looking at the raw program instead — which happens whenever a
+    # flag ahead of it swallowed `--apply` as one of its own values. `nix run
+    # REF --option` does exactly that: `--option` takes two, finds `--apply`
+    # and the expression, nix shrugs ("warning: unknown setting '--apply'"),
+    # and the eval SUCCEEDS returning `/nix/store/…-app/bin/run-app`.
+    #
+    # Left unchecked that path is truthy, so the caller skips the fallback and
+    # warms `nix build '/nix/store/…-app/bin/run-app'` — which on a cold store
+    # is not buildable at all ("don't know how to build these paths"). The warm
+    # then does NOTHING and the launch pays the full compile: strictly worse
+    # than the fallback it displaced. Falling back is always at least as good.
+    #
+    # Checked structurally rather than by adding `--option` to _NIX_VALUE_FLAGS
+    # (it is already there) or to some longer arity table: the defect is that a
+    # silently-`--apply`-less eval was trusted, and only validating the result
+    # covers the flags nobody enumerated.
+    if not paths or not all(p.endswith(".drv") for p in paths):
+        if verbose:
+            print(f"        {dim('resolve of ' + attr + ' did not yield a derivation; warming the package instead')}")
         return None
-    return [p + "^*" if p.endswith(".drv") else p for p in paths]
+    return [p + "^*" for p in paths]
 
 
 # ── Step Handlers ─────────────────────────────────────────────────────────────
