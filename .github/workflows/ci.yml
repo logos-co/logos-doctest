@@ -37,6 +37,14 @@ jobs:
       - name: Build the doctest CLI
         run: nix build .# -L
 
+      # Hermetic: fixture flakes with no inputs, evaluated but never built.
+      # Guards the ui_test pre-build against warming `packages.<sys>.default`
+      # when `nix run` would execute `apps.<sys>.default` — the two are
+      # different derivations for every ui_qml module, and the difference used
+      # to land inside launch_timeout as an unbuilt app.
+      - name: Unit-test the launch pre-build resolver
+        run: nix develop .# --command python3 tests/test_app_warm.py
+
       - name: Run the example spec end-to-end
         run: nix run .# -- run examples/hello.test.yaml --verbose
 
