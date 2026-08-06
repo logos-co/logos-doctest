@@ -20,6 +20,8 @@ Run with:  nix develop .# --command python3 tests/test_app_warm.py
 
 import importlib.util
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -87,13 +89,17 @@ FLAKE_PACKAGE_ONLY = """{
 """
 
 
-def _write_flake(text):
-    # realpath: on macOS /tmp is a symlink, and `path:` flake refs reject those
-    # ("error: path '//tmp' is a symlink").
-    d = os.path.realpath(tempfile.mkdtemp(prefix="doctest-warm-"))
-    with open(os.path.join(d, "flake.nix"), "w") as f:
-        f.write(text)
-    return d
+class FlakeFixtureMixin:
+    """Writes fixture flakes into temp dirs that are removed after each test."""
+
+    def _write_flake(self, text):
+        # realpath: on macOS /tmp is a symlink, and `path:` flake refs reject
+        # those ("error: path '//tmp' is a symlink").
+        d = os.path.realpath(tempfile.mkdtemp(prefix="doctest-warm-"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        with open(os.path.join(d, "flake.nix"), "w") as f:
+            f.write(text)
+        return d
 
 
 class ParseNixRun(unittest.TestCase):
@@ -136,7 +142,7 @@ class ParseNixRun(unittest.TestCase):
             self.assertIsNone(dt._parse_nix_run(cmd), cmd)
 
 
-class ResolveAppWarmTargets(unittest.TestCase):
+class ResolveAppWarmTargets(FlakeFixtureMixin, unittest.TestCase):
     """What the pre-build actually builds, resolved through nix."""
 
     @classmethod
@@ -154,7 +160,7 @@ class ResolveAppWarmTargets(unittest.TestCase):
         return out.stdout.strip()
 
     def test_resolves_the_app_derivation_not_the_package(self):
-        d = _write_flake(FLAKE_WITH_APP)
+        d = self._write_flake(FLAKE_WITH_APP)
         targets = dt._app_warm_installables(f"nix run path:{d}", os.getcwd())
         self.assertIsNotNone(targets, "app attribute should resolve")
         self.assertEqual(len(targets), 1, targets)
@@ -168,7 +174,7 @@ class ResolveAppWarmTargets(unittest.TestCase):
         self.assertNotEqual(target[:-len("^*")], self._drv_of_package(d))
 
     def test_the_resolved_derivation_is_what_nix_run_would_execute(self):
-        d = _write_flake(FLAKE_WITH_APP)
+        d = self._write_flake(FLAKE_WITH_APP)
         target = dt._app_warm_installables(f"nix run path:{d}", os.getcwd())[0]
         program = subprocess.run(
             ["nix", "eval", "--raw",
@@ -183,14 +189,68 @@ class ResolveAppWarmTargets(unittest.TestCase):
     def test_package_only_flake_falls_back(self):
         # No apps output: None tells the caller to keep the plain `nix build`
         # rewrite, which is the correct warm for those flakes.
-        d = _write_flake(FLAKE_PACKAGE_ONLY)
+        d = self._write_flake(FLAKE_PACKAGE_ONLY)
         self.assertIsNone(
             dt._app_warm_installables(f"nix run path:{d}", os.getcwd()))
 
     def test_unparseable_launch_falls_back(self):
-        d = _write_flake(FLAKE_WITH_APP)
+        d = self._write_flake(FLAKE_WITH_APP)
         self.assertIsNone(
             dt._app_warm_installables(f"cd x && nix run path:{d}", os.getcwd()))
+
+
+class LaunchFlagsSurviveTheShell(FlakeFixtureMixin, unittest.TestCase):
+    """The launch command's own flags reach nix as the words it meant.
+
+    The resolve runs through a shell, but `flags` arrive already split by
+    shlex. Re-joining them raw lets one flag value become several argv
+    entries; nix then rejects the surplus positional, the resolve fails, and
+    the caller silently degrades to the plain `nix build` rewrite — which is
+    exactly the wrong-target bug this whole module exists to prevent. A
+    fallback is invisible in the log, so only a test catches it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.system = dt._nix_system()
+        if not cls.system:
+            raise unittest.SkipTest("nix not available")
+
+    def _resolve(self, flake_dir, flags):
+        return dt._app_warm_installables(
+            f"nix run path:{flake_dir} {flags}", os.getcwd())
+
+    def test_space_inside_a_flag_value(self):
+        # nix's list-valued options are space separated, so this is an
+        # ordinary thing for a spec to carry.
+        d = self._write_flake(FLAKE_WITH_APP)
+        targets = self._resolve(
+            d, "--option extra-substituters "
+               "'https://a.example.org https://b.example.org'")
+        self.assertIsNotNone(
+            targets, "a space in a flag value must not defeat the resolve")
+        self.assertIn("warm-fixture-app", targets[0])
+
+    def test_metacharacter_inside_a_flag_value(self):
+        d = self._write_flake(FLAKE_WITH_APP)
+        targets = self._resolve(
+            d, "--option extra-substituters 'https://a.example.org;x'")
+        self.assertIsNotNone(
+            targets, "a ';' in a flag value must not defeat the resolve")
+        self.assertIn("warm-fixture-app", targets[0])
+
+    def test_flag_values_are_not_evaluated_by_the_shell(self):
+        # A value is data. Re-joining raw would let the shell expand it, so
+        # the warm would resolve something the launch never asked for.
+        d = self._write_flake(FLAKE_WITH_APP)
+        marker = os.path.join(d, "SUBSTITUTED")
+        targets = self._resolve(
+            d, f"--option extra-substituters '$(touch {shlex.quote(marker)})'")
+        self.assertFalse(
+            os.path.exists(marker),
+            "the flag value was expanded by the shell instead of passed through")
+        self.assertIsNotNone(targets)
+        self.assertIn("warm-fixture-app", targets[0])
 
 
 if __name__ == "__main__":

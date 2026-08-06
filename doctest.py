@@ -919,9 +919,17 @@ def _app_warm_installables(launch_cmd, workdir, verbose=False, timeout=None):
     else:
         return None                           # e.g. legacyPackages.x.y — not an app
 
+    # `flags` came out of shlex.split, i.e. they are already-unquoted words, and
+    # run_cmd runs this through a shell. Re-quote each one so it arrives at nix
+    # as the single word the launch command meant. Without this, a flag value
+    # holding a space (`--option extra-substituters 'https://a https://b'`) or a
+    # shell metacharacter splits into several argv entries, nix rejects the
+    # extra positional, and the failed resolve degrades silently to the plain
+    # `nix build` rewrite — reinstating the very bug this resolver fixes.
     eval_cmd = " ".join([
         "nix eval --raw", shlex.quote(f"{ref}#{attr}.program"),
-        *flags, "--apply", shlex.quote(_APP_PROGRAM_CTX),
+        *(shlex.quote(f) for f in flags),
+        "--apply", shlex.quote(_APP_PROGRAM_CTX),
     ])
     rc, out = run_cmd(eval_cmd, workdir, verbose, capture=True, timeout=timeout)
     if rc != 0:
