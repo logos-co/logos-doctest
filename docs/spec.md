@@ -196,6 +196,8 @@ Two modes:
 | `qt_mcp` | string | Path to the logos-qt-mcp package, relative to workdir (e.g., `result-mcp`). Falls back to `--qt-mcp` CLI flag or `LOGOS_QT_MCP` env var. |
 | `setup` | list of strings | Commands to run before testing (e.g., `nix build 'github:logos-co/logos-qt-mcp' -o result-mcp`). |
 | `inspector_port` | integer | TCP port for the QML inspector (default: 3768). |
+| `build_timeout` | integer | Seconds allowed for the pre-build of the launch command (default: 1800). |
+| `launch_timeout` | integer | Seconds to wait for the QML inspector after launching (default: 120). Boot time only — the app is pre-built first, see below. |
 | `tests` | list of objects | Test actions to execute. See below. |
 
 **Test actions:**
@@ -236,7 +238,20 @@ renders the screenshots even when served from GitHub Pages (where only the
 `index.html` is published). If a capture is missing (e.g. its step failed), the
 report falls back to the relative `images/<file>.png` link.
 
-**Runner behavior (launch mode):** Runs setup commands, launches the app in the background with `QT_QPA_PLATFORM=offscreen`, waits for the QML inspector to be available, generates a `.mjs` test file, runs it, then kills the app. Reports pass/fail.
+**Runner behavior (launch mode):** Runs setup commands, **pre-builds the app**, launches it in the background with `QT_QPA_PLATFORM=offscreen`, waits for the QML inspector to be available, generates a `.mjs` test file, runs it, then kills the app. Reports pass/fail.
+
+**Pre-build:** a `launch` that starts with `nix run` is built before the
+inspector clock starts, under `build_timeout` rather than `launch_timeout`, so
+a cold cache costs build time instead of failing the launch. What gets built is
+the flake output `nix run` will actually execute: for a flake with an `apps`
+output that is `apps.<system>.<name>`, resolved through the app's `program`
+attribute — **not** `packages.<system>.<name>`, which is a different derivation
+whenever an app wraps its package (a `type: ui_qml` Logos module is the standard
+case: `packages.default` is the plugin alone, `apps.default` is the standalone
+app plus the plugin dir and every dependency module). Flakes with no matching
+app attribute, and launch commands that aren't a plain `nix run` (a `cd … &&`
+prefix, an env-var prefix), fall back to building the installable as a package.
+Nothing is executed during the pre-build, so a GUI app cannot hang it.
 
 **Runner behavior (binary mode):** Runs setup + build, generates a `.mjs` test file, runs it via `node test.mjs --ci <binary> --verbose`. Reports pass/fail.
 
