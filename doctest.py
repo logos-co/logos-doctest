@@ -1266,6 +1266,191 @@ import socket
 import time
 
 
+# ── Pre-building (“warming”) a `nix run` launch ───────────────────────────────
+#
+# A ui_test `launch:` is normally `nix run <flake>`, and `nix run` compiles the
+# app on first use. That compile must not happen on the inspector clock, so we
+# realise the app's closure first, under `build_timeout`, before the launch.
+#
+# The catch is that `nix run <flake>` and `nix build <flake>` are DIFFERENT
+# flake outputs:
+#
+#     nix build .   ->  packages.<system>.default
+#     nix run   .   ->  apps.<system>.default
+#
+# For a `type: ui_qml` module those two are genuinely disjoint: packages.default
+# is the plugin alone, while apps.default is logos-standalone-app wired to a
+# plugin dir (mkStandaloneApp) — the app pulls in the whole standalone-app /
+# ui-host / liblogos / design-system stack that the plugin never references. So
+# rewriting `nix run X` into `nix build X` warmed the wrong closure entirely and
+# left the app's several-hundred-second compile to happen inside the launch's
+# `launch_timeout`, which is where it timed out ("inspector not available on
+# port 3768 after 300s" — the app never booted).
+#
+# You cannot simply point `nix build` at the app attribute:
+#
+#     $ nix build .#apps.aarch64-darwin.default
+#     error: expected flake output attribute 'apps.…default' to be a derivation
+#            or path but found a set: { type = "app"; program = «thunk»; }
+#     $ nix build .#apps.aarch64-darwin.default.program
+#     error: string '/nix/store/…/bin/run' has context with the output 'out'
+#            from derivation '/nix/store/….drv', but the string is not the right
+#            placeholder for this derivation output
+#
+# and realising the *output path* that `program` points at is not enough either
+# — an output path on its own has no deriver, so on a cold cache (exactly the
+# case the warm step exists for) nix can only substitute it, never build it:
+#
+#     $ nix build /nix/store/…-run-logos-standalone-ui
+#     error: path '…' is required, but there is no substituter that can build it
+#
+# What does work is going one step further back: `program` is a string whose
+# *string context* names the derivation that produces it. Evaluating
+#
+#     nix eval --raw <ref>#apps.<system>.<attr> \
+#       --apply 'a: … builtins.attrNames (builtins.getContext a.program)'
+#
+# instantiates that derivation (writing the .drv) without running anything, and
+# `nix build '<drv>^*'` then realises it from source or cache like any other
+# build. No GUI is launched and nothing can hang.
+#
+# Flakes with no `apps.<system>.<attr>` fall back to the plain
+# `nix build <installable>` rewrite — that is what `nix run` itself falls back
+# to (packages/legacyPackages), and it keeps ordinary specs behaving exactly as
+# before.
+
+# Flags whose *following* tokens are values, not the installable. Anything else
+# starting with "-" is treated as a valueless flag; the first bare token left is
+# the installable.
+_NIX_FLAG_ARITY = {
+    "--override-input": 2, "--arg": 2, "--argstr": 2, "--option": 2,
+    "--inputs-from": 1, "--update-input": 1, "--reference-lock-file": 1,
+    "--output-lock-file": 1, "--expr": 1, "--file": 1, "-f": 1,
+    "--include": 1, "-I": 1, "--max-jobs": 1, "-j": 1, "--cores": 1,
+    "--builders": 1, "--log-format": 1, "--store": 1, "--eval-store": 1,
+    "--substituters": 1, "--extra-substituters": 1, "--system": 1,
+    "--timeout": 1, "--apply": 1, "--out-link": 1, "-o": 1,
+}
+
+_NIX_SYSTEM = None
+
+
+def _nix_system(workdir):
+    """The nix system double for this machine (aarch64-darwin, x86_64-linux…)."""
+    global _NIX_SYSTEM
+    if _NIX_SYSTEM is None:
+        try:
+            r = subprocess.run(
+                ["nix", "eval", "--impure", "--raw", "--expr",
+                 "builtins.currentSystem"],
+                cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, timeout=120,
+            )
+            _NIX_SYSTEM = r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            _NIX_SYSTEM = ""
+    return _NIX_SYSTEM
+
+
+def split_nix_run(cmd):
+    """Split a `nix run` command into (installable, flags).
+
+    `flags` keeps the nix flags (`--override-input …`, `--no-write-lock-file`,
+    …) and drops everything after a bare `--`, which `nix run` passes to the
+    program and no other nix subcommand accepts. Returns None when `cmd` is not
+    a plain `nix run` invocation (a shell pipeline, `sh -c '…'`, a prebuilt
+    binary path, …) so callers can leave it alone.
+    """
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        return None
+    if len(toks) < 2 or toks[0] != "nix" or toks[1] != "run":
+        return None
+    rest = toks[2:]
+    if "--" in rest:
+        rest = rest[:rest.index("--")]
+
+    installable, flags, i = None, [], 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok.startswith("-") and tok != "-":
+            arity = 0 if "=" in tok else _NIX_FLAG_ARITY.get(tok, 0)
+            flags.extend(rest[i:i + 1 + arity])
+            i += 1 + arity
+            continue
+        if installable is None:
+            installable = tok
+        else:                       # extra positional: not a shape we model
+            return None
+        i += 1
+    return (installable or "."), flags
+
+
+def _app_drvs(installable, flags, workdir, verbose=False, timeout=1800):
+    """Derivations that produce the program `nix run <installable>` executes.
+
+    Empty when the flake has no matching `apps.<system>.<attr>` (or its program
+    string carries no derivation context, e.g. a `builtins.storePath`), which is
+    the caller's cue to fall back to `nix build <installable>`.
+    """
+    # `nix run` looks the app up under the target system, which `--system` can
+    # move; otherwise it is this machine's.
+    system = (flags[flags.index("--system") + 1]
+              if "--system" in flags and flags.index("--system") + 1 < len(flags)
+              else _nix_system(workdir))
+    if not system:
+        return []
+    ref, _, frag = installable.partition("#")
+    attr = frag or "default"
+    apply_expr = ('a: builtins.concatStringsSep "\\n" '
+                  '(builtins.attrNames (builtins.getContext a.program))')
+    cmd = " ".join(
+        ["nix", "eval", "--raw", shlex.quote(f"{ref}#apps.{system}.{attr}"),
+         "--apply", shlex.quote(apply_expr)]
+        + [shlex.quote(f) for f in flags]
+    )
+    if verbose:
+        print(f"        cmd: {dim(cmd)}")
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=workdir,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=timeout)
+    except Exception:
+        return []
+    if r.returncode != 0:
+        if verbose:
+            why = (r.stderr or "").strip().splitlines()
+            print(f"        {dim('no app attribute: ' + (why[-1] if why else 'eval failed'))}")
+        return []
+    return [p for p in (r.stdout or "").split("\n")
+            if p.startswith("/nix/store/") and p.endswith(".drv")]
+
+
+def nix_run_warm_command(launch_cmd, workdir, verbose=False, timeout=1800):
+    """The `nix build` command that realises what `launch_cmd` will run.
+
+    Prefers the app attribute's own derivation (see the block comment above);
+    falls back to the historical `nix run X` -> `nix build X` rewrite when the
+    flake exposes no such app. Returns None if `launch_cmd` is not a `nix run`.
+    """
+    parts = split_nix_run(launch_cmd)
+    if parts is None:
+        return None
+    installable, flags = parts
+
+    drvs = _app_drvs(installable, flags, workdir, verbose, timeout)
+    if drvs:
+        # The .drv is fully resolved — the flake flags were already applied at
+        # eval time, so they must not (and need not) be repeated here.
+        return " ".join(["nix", "build", "--no-link", "-L"]
+                        + [shlex.quote(d + "^*") for d in drvs])
+
+    warm = " ".join(["nix", "build", shlex.quote(installable)]
+                    + [shlex.quote(f) for f in flags])
+    return warm + " -L"
+
+
 def _wait_for_inspector(host="localhost", port=3768, timeout=60, proc=None):
     """Poll until the QML inspector TCP port accepts connections.
 
@@ -1389,11 +1574,15 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
         # never even boots before we give up. Building first (best effort)
         # means the subsequent launch only has to boot, not compile. Output is
         # streamed with -L so a real build failure is visible in CI logs.
-        if launch_cmd.lstrip().startswith("nix run"):
-            warm_cmd = "nix build" + launch_cmd.lstrip()[len("nix run"):]
-            if " -L" not in warm_cmd:
-                warm_cmd += " -L"
-            build_timeout = ui_spec.get("build_timeout", 1800)
+        #
+        # `nix run` and `nix build` read different flake outputs, so this
+        # resolves the app attribute's own derivation rather than assuming
+        # packages.default is what gets launched — see the block comment above
+        # nix_run_warm_command().
+        build_timeout = ui_spec.get("build_timeout", 1800)
+        warm_cmd = nix_run_warm_command(launch_cmd, workdir, verbose,
+                                        timeout=build_timeout)
+        if warm_cmd:
             print(f"  Pre-building app: {warm_cmd}")
             wrc, _ = run_cmd(warm_cmd, workdir, verbose, timeout=build_timeout)
             if wrc != 0:

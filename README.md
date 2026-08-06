@@ -302,6 +302,7 @@ logos-doctest/
 │   ├── 06-run-sh-and-artifacts.test.yaml   # writing a run.sh: the run/generate loop, outputs/, --release-for
 │   ├── 07-ci-and-github-pages.test.yaml    # CI workflow + publishing reports to GitHub Pages
 │   └── run.sh                              # run + generate the suite locally
+├── tests/test_warm_step.py    # unit tests for the ui_test pre-build step
 └── .github/workflows/ci.yml   # self-test: example + the doctests/ suite
 ```
 

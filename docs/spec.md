@@ -196,6 +196,8 @@ Two modes:
 | `qt_mcp` | string | Path to the logos-qt-mcp package, relative to workdir (e.g., `result-mcp`). Falls back to `--qt-mcp` CLI flag or `LOGOS_QT_MCP` env var. |
 | `setup` | list of strings | Commands to run before testing (e.g., `nix build 'github:logos-co/logos-qt-mcp' -o result-mcp`). |
 | `inspector_port` | integer | TCP port for the QML inspector (default: 3768). |
+| `build_timeout` | integer | Seconds allowed for the pre-build of a `nix run` launch (default: 1800). See *Pre-building* below. |
+| `launch_timeout` | integer | Seconds to wait for the app's QML inspector after launching (default: 120). Compiling must not happen on this clock — that is what `build_timeout` is for. |
 | `tests` | list of objects | Test actions to execute. See below. |
 
 **Test actions:**
@@ -237,6 +239,22 @@ renders the screenshots even when served from GitHub Pages (where only the
 report falls back to the relative `images/<file>.png` link.
 
 **Runner behavior (launch mode):** Runs setup commands, launches the app in the background with `QT_QPA_PLATFORM=offscreen`, waits for the QML inspector to be available, generates a `.mjs` test file, runs it, then kills the app. Reports pass/fail.
+
+**Pre-building (“warming”) a `nix run` launch:** when `launch` is a `nix run`
+command, the runner realises the app's closure *before* it starts the inspector
+clock, so a cold-cache compile is charged to `build_timeout` and not to
+`launch_timeout`. It warms the **app** output, not `packages.default` — those
+are different flake outputs, and for a `type: ui_qml` module they are disjoint
+closures (`packages.default` is the plugin; `apps.default` is
+`logos-standalone-app` wired to a plugin dir, which pulls in the whole
+standalone-app/liblogos/design-system stack the plugin never references). The
+runner resolves `apps.<system>.<attr>` for the launch's installable, takes the
+derivation from the `program` string's context, and builds that — nothing is
+executed, so no GUI opens and the warm step cannot hang. Flake flags on the
+`nix run` (`--override-input …`, `--no-write-lock-file`, …) are honoured;
+anything after a bare `--` is program arguments and is dropped. Flakes that
+expose no matching app fall back to `nix build <installable>`, which is what
+`nix run` itself falls back to.
 
 **Runner behavior (binary mode):** Runs setup + build, generates a `.mjs` test file, runs it via `node test.mjs --ci <binary> --verbose`. Reports pass/fail.
 

@@ -37,6 +37,13 @@ jobs:
       - name: Build the doctest CLI
         run: nix build .# -L
 
+      # Pure-evaluation unit tests for the ui_test pre-build ("warm") step: it
+      # must realise the flake's `apps.<system>` output — what `nix run`
+      # executes — and not `packages.default`, which for a ui_qml module is a
+      # different closure entirely. Instantiation only, so no builder runs.
+      - name: Warm-step regression tests
+        run: nix develop -c python3 tests/test_warm_step.py
+
       - name: Run the example spec end-to-end
         run: nix run .# -- run examples/hello.test.yaml --verbose
 
