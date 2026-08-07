@@ -808,6 +808,178 @@ def run_cmd(cmd, workdir, verbose=False, capture=False, timeout=None):
         return 1, str(e)
 
 
+# ── Warming a `nix run` launch ────────────────────────────────────────────────
+#
+# `nix run REF` executes `apps.<system>.<name>.program`, which for a flake that
+# defines an app is a DIFFERENT output attribute from `packages.<system>.*`.
+# Rewriting the launch command's `nix run` into `nix build` therefore warms the
+# wrong derivation for every such flake — including every `type: ui_qml` Logos
+# module, where `packages.default` is just the plugin while `apps.default` is
+# the standalone app + a plugin dir + every dependency module. The app's whole
+# compile then landed on the launch step, inside `launch_timeout` instead of
+# `build_timeout`, and the app "never opened its inspector".
+#
+# Two obvious repairs do not work:
+#   nix build REF#apps.<sys>.default
+#     error: expected flake output attribute '...' to be a derivation or path
+#            but found a set: { type = "app"; program = «thunk»; }
+#   nix build REF#apps.<sys>.default.program
+#     error: string '/nix/store/…-run-app/bin/run-app' has context with the
+#            output 'out' from derivation '/nix/store/….drv', but the string is
+#            not the right placeholder for this derivation output
+#
+# The second error names the way through: the program string carries the
+# derivation in its context. Reading that context out is exactly how `nix run`
+# itself finds what to build, it needs no cooperation from the app (nothing is
+# executed, so a GUI app cannot hang the warm step on a `--version` it ignores),
+# and the resulting `.drv` is a plain buildable installable.
+_APP_PROGRAM_CTX = (
+    'p: builtins.concatStringsSep "\\n" '
+    '(builtins.attrNames (builtins.getContext p))'
+)
+
+# Flags `nix build` understands but `nix eval` does not; passing them through
+# would fail the resolve and silently drop us onto the fallback.
+_BUILD_ONLY_FLAGS = {
+    "-o": 1, "--out-link": 1, "--no-link": 0, "--print-out-paths": 0,
+    "--rebuild": 0, "--keep-going": 0, "-k": 0,
+}
+
+_NIX_SYSTEM = None
+
+
+def _nix_system():
+    """`builtins.currentSystem`, resolved once — needed to spell `apps.<sys>`."""
+    global _NIX_SYSTEM
+    if _NIX_SYSTEM is None:
+        rc, out = run_cmd(
+            "nix eval --impure --raw --expr builtins.currentSystem",
+            None, capture=True, timeout=120)
+        _NIX_SYSTEM = out.strip().splitlines()[-1].strip() if rc == 0 and out.strip() else ""
+    return _NIX_SYSTEM
+
+
+def _parse_nix_run(cmd):
+    """Split a plain `nix run` command into (flake_ref, fragment, eval_flags).
+
+    Returns None for anything that isn't a single, self-contained `nix run`
+    — shell operators, env-var prefixes, unbalanced quotes — so the caller
+    keeps the old rewrite rather than guessing.
+    """
+    try:
+        tokens = shlex.split(cmd.strip())
+    except ValueError:
+        return None
+    if len(tokens) < 2 or tokens[0] != "nix" or tokens[1] != "run":
+        return None
+    if any(t in ("&&", "||", ";", "|", "&") or t.startswith(("(", ")")) for t in tokens):
+        return None
+
+    flags, ref, i = [], None, 2
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--":
+            break                      # the rest is the app's own argv
+        if tok.startswith("-"):
+            n = _NIX_VALUE_FLAGS.get(tok, _BUILD_ONLY_FLAGS.get(tok, 0))
+            if tok not in _BUILD_ONLY_FLAGS:
+                flags += tokens[i:i + 1 + n]
+            i += 1 + n
+            continue
+        if ref is None:
+            ref = tok
+        i += 1
+
+    ref = ref or "."
+    base, _, fragment = ref.partition("#")
+    return base or ".", fragment, flags
+
+
+def _app_warm_installables(launch_cmd, workdir, verbose=False, timeout=None):
+    """Resolve what `nix run <launch_cmd>` will execute into installables.
+
+    Returns a list such as ['/nix/store/…-run-app.drv^*'], or None when the
+    command targets no app attribute at all (a `packages.<sys>.*` run, a
+    non-flake installable, a command we don't parse, an eval failure). None
+    means "fall back to the plain `nix build` rewrite", which is the correct
+    warm for exactly those cases.
+    """
+    parsed = _parse_nix_run(launch_cmd)
+    if not parsed:
+        return None
+    ref, fragment, flags = parsed
+
+    if fragment.startswith("apps."):
+        attr = fragment                       # already a full app attr path
+    elif re.fullmatch(r"[A-Za-z0-9_-]*", fragment):
+        system = _nix_system()
+        if not system:
+            return None
+        attr = f"apps.{system}.{fragment or 'default'}"
+    else:
+        return None                           # e.g. legacyPackages.x.y — not an app
+
+    # `flags` came out of shlex.split, i.e. they are already-unquoted words, and
+    # run_cmd runs this through a shell. Re-quote each one so it arrives at nix
+    # as the single word the launch command meant. Without this, a flag value
+    # holding a space (`--option extra-substituters 'https://a https://b'`) or a
+    # shell metacharacter splits into several argv entries, nix rejects the
+    # extra positional, and the failed resolve degrades silently to the plain
+    # `nix build` rewrite — reinstating the very bug this resolver fixes.
+    #
+    # Deliberate asymmetry, and the one thing to know before writing a spec that
+    # leans on it: the LAUNCH still goes through `subprocess(..., shell=True)`,
+    # so its flag values are shell-expanded, while this resolve's are not. A
+    # launch flag whose value only means something after expansion —
+    # `--override-input dep 'path:$DEPDIR'`, or a `~` — therefore resolves to
+    # nothing here, the resolve fails, and the warm quietly drops to the plain
+    # `nix build` rewrite (correct-ish, just not the app). Expansion is not
+    # added back because it would make the warm build a target the launch never
+    # named. Nothing in-tree relies on it: `expand_vars` handles only {ext},
+    # {shared_flags} and {release}, and no `nix run` launch line carries a
+    # shell variable. Spell such a value out, or set it via `build_overrides`.
+    eval_cmd = " ".join([
+        "nix eval --raw", shlex.quote(f"{ref}#{attr}.program"),
+        *(shlex.quote(f) for f in flags),
+        "--apply", shlex.quote(_APP_PROGRAM_CTX),
+    ])
+    rc, out = run_cmd(eval_cmd, workdir, verbose, capture=True, timeout=timeout)
+    if rc != 0:
+        if verbose:
+            print(f"        {dim('no app attribute at ' + attr + '; warming the package instead')}")
+        return None
+
+    # stderr is folded into stdout here (nix warns about dirty git trees), so
+    # take only the store paths the --apply produced.
+    paths = [ln.strip() for ln in out.splitlines()
+             if ln.strip().startswith("/nix/store/")]
+
+    # Every line must be a `.drv`, because that is all `builtins.getContext`
+    # can key: the derivations the program string depends on. A store path that
+    # is NOT a derivation means the eval did not run the `--apply` we asked for
+    # and we are looking at the raw program instead — which happens whenever a
+    # flag ahead of it swallowed `--apply` as one of its own values. `nix run
+    # REF --option` does exactly that: `--option` takes two, finds `--apply`
+    # and the expression, nix shrugs ("warning: unknown setting '--apply'"),
+    # and the eval SUCCEEDS returning `/nix/store/…-app/bin/run-app`.
+    #
+    # Left unchecked that path is truthy, so the caller skips the fallback and
+    # warms `nix build '/nix/store/…-app/bin/run-app'` — which on a cold store
+    # is not buildable at all ("don't know how to build these paths"). The warm
+    # then does NOTHING and the launch pays the full compile: strictly worse
+    # than the fallback it displaced. Falling back is always at least as good.
+    #
+    # Checked structurally rather than by adding `--option` to _NIX_VALUE_FLAGS
+    # (it is already there) or to some longer arity table: the defect is that a
+    # silently-`--apply`-less eval was trusted, and only validating the result
+    # covers the flags nobody enumerated.
+    if not paths or not all(p.endswith(".drv") for p in paths):
+        if verbose:
+            print(f"        {dim('resolve of ' + attr + ' did not yield a derivation; warming the package instead')}")
+        return None
+    return [p + "^*" for p in paths]
+
+
 # ── Step Handlers ─────────────────────────────────────────────────────────────
 
 def handle_file(step, workdir, results, verbose):
@@ -1389,12 +1561,26 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
         # never even boots before we give up. Building first (best effort)
         # means the subsequent launch only has to boot, not compile. Output is
         # streamed with -L so a real build failure is visible in CI logs.
+        #
+        # What to build is resolved from the app attribute `nix run` will
+        # execute (see _app_warm_installables): rewriting `nix run` into
+        # `nix build` warms `packages.<sys>.default`, which for a ui_qml module
+        # is the plugin alone and not the standalone app around it. Flakes with
+        # no app output fall back to that rewrite, which is right for them.
         if launch_cmd.lstrip().startswith("nix run"):
-            warm_cmd = "nix build" + launch_cmd.lstrip()[len("nix run"):]
-            if " -L" not in warm_cmd:
-                warm_cmd += " -L"
             build_timeout = ui_spec.get("build_timeout", 1800)
-            print(f"  Pre-building app: {warm_cmd}")
+            targets = _app_warm_installables(
+                launch_cmd, workdir, verbose, timeout=build_timeout)
+            if targets:
+                warm_cmd = "nix build --no-link -L " + " ".join(
+                    shlex.quote(t) for t in targets)
+                print(f"  Pre-building app: {warm_cmd}")
+                print(f"        {dim('(the apps output of: ' + launch_cmd + ')')}")
+            else:
+                warm_cmd = "nix build" + launch_cmd.lstrip()[len("nix run"):]
+                if " -L" not in warm_cmd:
+                    warm_cmd += " -L"
+                print(f"  Pre-building app: {warm_cmd}")
             wrc, _ = run_cmd(warm_cmd, workdir, verbose, timeout=build_timeout)
             if wrc != 0:
                 print(f"        {yellow('pre-build returned non-zero; launching anyway')}")
