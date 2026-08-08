@@ -707,6 +707,42 @@ def _split_substitutions(seg):
     return chunks
 
 
+def _split_at_arg_separator(seg):
+    """Split `seg` at its first top-level `--` token into (before, sep_onwards).
+
+    `nix run REF -- --height 1000` hands everything after `--` to the LAUNCHED
+    PROGRAM, not to nix. Flags appended to the end of such a command therefore
+    reach the app, which rejects them and exits — so injection has to land to
+    the LEFT of the separator.
+
+    Quote-aware, and only a bare `--` word counts: `--height` is a flag, and a
+    `--` inside quotes (`echo "a -- b"`) is literal text, not a separator.
+    Returns (seg, "") when there is no separator, i.e. plain append.
+    """
+    i, n, quote = 0, len(seg), None
+    while i < n:
+        ch = seg[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                i += 2; continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            i += 2; continue
+        if ch in "'\"":
+            quote = ch; i += 1; continue
+        # A separator is a bare `--` delimited by whitespace on both sides
+        # (or the end of the segment).
+        if (seg.startswith("--", i)
+                and (i == 0 or seg[i - 1].isspace())
+                and (i + 2 == n or seg[i + 2].isspace())):
+            return seg[:i], seg[i:]
+        i += 1
+    return seg, ""
+
+
 def _inject_into_block(block, override_flags, workdir):
     """Inject into every nix command inside one shell block."""
     out = []
@@ -762,9 +798,16 @@ def _inject_into_block(block, override_flags, workdir):
             # backgrounding `&` is a SEPARATOR here, so it already sits in
             # `sep` — the flags land on the command, not after the `&` where
             # they used to run as a command of their own.
-            body = seg.rstrip()
-            trailing = seg[len(body):]
-            seg = f"{body} {' '.join(extra)}{trailing}"
+            #
+            # Everything after a top-level `--` belongs to the program `nix run`
+            # launches, so inject to the LEFT of it. Appending blindly sent the
+            # flags to the app, which rejected them and exited before the QML
+            # inspector opened — silently breaking every ui_test spec whenever
+            # --workspace-pins was active.
+            head, rest = _split_at_arg_separator(seg)
+            body = head.rstrip()
+            trailing = head[len(body):] if not rest else " "
+            seg = f"{body} {' '.join(extra)}{trailing}{rest}"
 
         out.append(seg + sep)
 
