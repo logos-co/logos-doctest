@@ -45,6 +45,13 @@ jobs:
       - name: Unit-test the launch pre-build resolver
         run: nix develop .# --command python3 tests/test_app_warm.py
 
+      # `nix run REF -- <app args>` hands everything after `--` to the launched
+      # program. Injected flags appended past it reached the APP, which rejected
+      # them and exited before opening its inspector — silently breaking every
+      # ui_test spec whenever --workspace-pins was active.
+      - name: Unit-test flag injection around a `--`
+        run: nix develop .# --command python3 tests/test_inject_double_dash.py
+
       - name: Run the example spec end-to-end
         run: nix run .# -- run examples/hello.test.yaml --verbose
 
