@@ -2074,8 +2074,9 @@ def cmd_run(args):
 
     global _REPORT, _IMAGES_DIR
     # The TUI reads per-step execution records from the collector, so it needs
-    # one active even without --report.
-    if getattr(args, "report", None) or tui:
+    # one active even without --report. --results wants the same data, just
+    # serialized instead of rendered.
+    if getattr(args, "report", None) or getattr(args, "results", None) or tui:
         _REPORT = ReportCollector()
 
     # When the caller picks a persistent output directory, write ui_test
@@ -2094,14 +2095,30 @@ def cmd_run(args):
 
     ok = results.summary()
 
-    # Build the HTML report before cleanup removes the working directories.
+    # Build the report BEFORE cleanup removes the working directories -- the
+    # payload inlines ui_test screenshots from them.
     if _REPORT is not None:
         try:
-            report_path = os.path.abspath(args.report)
-            write_html_report(_REPORT, report_path, results)
-            print(f"  report : {report_path}")
+            payload = build_report_payload(_REPORT, results)
         except Exception as e:
-            print(f"  {yellow(f'report generation failed: {e}')}")
+            payload = None
+            print(f"  {yellow(f'report data could not be built: {e}')}")
+        if payload is not None:
+            if getattr(args, "report", None):
+                try:
+                    report_path = os.path.abspath(args.report)
+                    with open(report_path, "w") as f:
+                        f.write(render_report_html(payload))
+                    print(f"  report : {report_path}")
+                except Exception as e:
+                    print(f"  {yellow(f'report generation failed: {e}')}")
+            if getattr(args, "results", None):
+                try:
+                    results_path = os.path.abspath(args.results)
+                    write_results_json(payload, results_path)
+                    print(f"  results: {results_path}")
+                except Exception as e:
+                    print(f"  {yellow(f'results generation failed: {e}')}")
 
     for cleanup in cleanups:
         try:
@@ -2577,25 +2594,53 @@ def _capture_fds():
         tmp.close()
 
 
-def write_html_report(collector, output_path, results):
-    import json as _json
-    model = build_report_model(collector)
-    payload = {
-        "generated_platform": f"{platform.system()}",
+# The payload is the whole report: `build_report_model` already returns a
+# JSON-serializable model (rows of rendered markdown + execution records), so
+# rendering needs nothing from the running process. Splitting the payload out of
+# the writer is what lets a run on one machine be rendered on another -- see
+# `run --results` and `report --from-results`.
+REPORT_PAYLOAD_VERSION = 1
+
+
+def build_report_payload(collector, results, platform_label=None):
+    """The complete, self-contained report data. `platform_label` names the
+    machine the steps RAN on, which is not necessarily this one."""
+    return {
+        "version": REPORT_PAYLOAD_VERSION,
+        "generated_platform": platform_label or platform.system(),
         "summary": {
             "passed": results.passed,
             "failed": results.failed,
             "skipped": results.skipped,
         },
-        "tutorials": model,
+        "tutorials": build_report_model(collector),
     }
-    data_json = _json.dumps(payload)
+
+
+def render_report_html(payload):
+    """Payload -> the self-contained HTML string. Pure; no filesystem, no
+    collector, no globals."""
+    import json as _json
+    # sort_keys matches write_results_json, so `run --report` and
+    # `report --from-results <that run\'s --results>` emit BYTE-IDENTICAL html.
+    # Without it they differ only in key order -- semantically equal, but then
+    # the round trip can only be asserted by parsing both sides, and "equal
+    # after I re-parse it" is a much weaker thing to test than `cmp`.
+    data_json = _json.dumps(payload, sort_keys=True)
     # Close any literal </script> in the data so it can't terminate the tag.
     data_json = data_json.replace("</", "<\\/")
+    return _REPORT_HTML_TEMPLATE.replace("__DATA__", data_json)
 
-    html = _REPORT_HTML_TEMPLATE.replace("__DATA__", data_json)
+
+def write_results_json(payload, output_path):
+    import json as _json
     with open(output_path, "w") as f:
-        f.write(html)
+        _json.dump(payload, f, indent=1, sort_keys=True)
+
+
+def write_html_report(collector, output_path, results):
+    with open(output_path, "w") as f:
+        f.write(render_report_html(build_report_payload(collector, results)))
 
 
 _REPORT_HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -3308,6 +3353,68 @@ def cmd_clean(args):
 # CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
+def cmd_report(args):
+    """Render a report from a payload produced elsewhere.
+
+    This is the half of `run --report` that does not need the run: the payload
+    carries the rendered markdown and the execution records, so nothing here
+    touches a spec, a working directory or nix. That is the point -- it lets
+    steps execute on a machine that cannot run this tool (a Windows runner, say,
+    where `nix` does not exist) and still produce the same report as every other
+    platform.
+    """
+    import json as _json
+    try:
+        with open(args.results_json) as f:
+            payload = _json.load(f)
+    except Exception as e:
+        print(f"ERROR: could not read {args.results_json}: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if not isinstance(payload, dict) or "tutorials" not in payload:
+        print(f"ERROR: {args.results_json} is not a doctest results payload "
+              f"(no 'tutorials' key).", file=sys.stderr)
+        sys.exit(2)
+
+    # A newer payload may carry fields this renderer drops, which is survivable.
+    # An OLDER one predates a field this renderer expects, which is not, and
+    # silently rendering a half-empty report would be worse than refusing.
+    ver = payload.get("version")
+    if ver is not None and ver > REPORT_PAYLOAD_VERSION:
+        print(f"WARNING: payload version {ver} is newer than this tool's "
+              f"{REPORT_PAYLOAD_VERSION}; rendering anyway, some data may be "
+              f"ignored.", file=sys.stderr)
+
+    if args.platform_label:
+        payload["generated_platform"] = args.platform_label
+
+    n_tut = len(payload.get("tutorials") or [])
+    n_rows = sum(len(t.get("rows") or []) for t in (payload.get("tutorials") or []))
+    n_exec = sum(len(r.get("execs") or [])
+                 for t in (payload.get("tutorials") or [])
+                 for r in (t.get("rows") or []))
+    # Refuse a payload with no execution in it. It renders as a perfectly
+    # plausible report -- the left column is just the tutorial -- so nothing
+    # downstream could tell it apart from a run where every step passed.
+    if n_exec == 0:
+        print(f"ERROR: {args.results_json} contains {n_tut} tutorial(s) and "
+              f"{n_rows} row(s) but ZERO execution records. That renders as a "
+              f"report which looks complete and asserts nothing. Refusing.",
+              file=sys.stderr)
+        sys.exit(2)
+
+    out = os.path.abspath(args.output)
+    with open(out, "w") as f:
+        f.write(render_report_html(payload))
+    summ = payload.get("summary") or {}
+    print(f"  report : {out}")
+    print(f"  from   : {args.results_json} "
+          f"({n_tut} tutorial(s), {n_exec} execution record(s), "
+          f"platform {payload.get('generated_platform', '?')})")
+    print(f"  summary: {summ.get('passed', 0)} passed, {summ.get('failed', 0)} "
+          f"failed, {summ.get('skipped', 0)} skipped")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="doctest",
@@ -3356,6 +3463,15 @@ def main():
                                  "repo's own committed flake.lock. Rebuilds a lot "
                                  "-- intended for the logos-workspace "
                                  "tests-and-doctests job, not everyday runs.")
+    run_parser.add_argument("--results", default=None, metavar="PATH",
+                            help="Write the report DATA as JSON instead of (or "
+                                 "as well as) rendering it. The same payload "
+                                 "--report embeds, so it can be rendered later "
+                                 "on another machine: `doctest report "
+                                 "--from-results`. Useful anywhere a run and "
+                                 "its report happen in different places -- and "
+                                 "it is the only machine-readable output this "
+                                 "tool has.")
     run_parser.add_argument("--report", default=None, metavar="PATH",
                             help="Write a two-column HTML report (rendered docs + "
                                  "the commands actually run and their output) to PATH")
@@ -3381,6 +3497,21 @@ def main():
                                  "hash, e.g. --release-for logos-logoscore-cli=abc123 "
                                  "(repeatable; overrides --release for that repo)")
 
+    # ── report ────────────────────────────────────────────────────────────
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Render an HTML report from a `run --results` JSON payload")
+    report_parser.add_argument("results_json", metavar="RESULTS.json",
+                               help="Payload written by `doctest run --results`")
+    report_parser.add_argument("-o", "--output", required=True, metavar="PATH",
+                               help="Where to write the HTML report")
+    report_parser.add_argument("--platform-label", default=None, metavar="NAME",
+                               help="Override the platform shown in the report "
+                                    "header. The payload already records where "
+                                    "the steps RAN, which is the honest value "
+                                    "and the default; use this only when that "
+                                    "producer could not name itself.")
+
     # ── clean ─────────────────────────────────────────────────────────────
     clean_parser = subparsers.add_parser(
         "clean",
@@ -3401,6 +3532,8 @@ def main():
         cmd_run(args)
     elif args.command == "generate":
         cmd_generate(args)
+    elif args.command == "report":
+        cmd_report(args)
     elif args.command == "clean":
         cmd_clean(args)
 
