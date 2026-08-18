@@ -73,6 +73,15 @@ LIB_EXT = "dylib" if IS_MACOS else "so"
 # generated script for a Windows target expands it to ".exe" (see emit-smoke
 # --exe). Specs write `./foo/bin/tool{exe}` so one line serves all three.
 EXE_SUFFIX = ""
+
+# What `platform:` in a spec means for THIS machine, when --platform is not
+# given. Without this default, a `run` with no flag executes every marked step
+# regardless of platform -- so adding a `platform: windows` section to a spec
+# would silently break every existing CI job that invokes `doctest run` without
+# one. Measured on logos-package-manager's lgpm-cli: the windows variant step
+# overwrote the unix one and the install then failed.
+HOST_PLATFORM = {"Linux": "linux", "Darwin": "macos",
+                 "Windows": "windows"}.get(platform.system(), platform.system().lower())
 SHARED_FLAGS = "-dynamiclib" if IS_MACOS else "-shared -fPIC"
 
 
@@ -1953,14 +1962,15 @@ def _run_single_spec(spec, spec_path, workdir, args, results):
             # --platform selects one leg of a cross-platform spec. A step with
             # no `platform:` (and in no marked section) runs everywhere, so
             # every existing spec is unaffected.
-            want = getattr(args, "platform", None)
-            if want:
-                own = _platforms_of(step)
-                marks = own if own is not None else _platforms_of(section)
-                if marks is not None and want.strip().lower() not in marks:
-                    results.skip(step.get("title", "untitled"),
-                                 f"platform {'/'.join(sorted(marks))}")
-                    continue
+            # Defaults to the host, so an existing job that passes no
+            # --platform keeps doing the right thing when a spec gains marks.
+            want = (getattr(args, "platform", None) or HOST_PLATFORM).strip().lower()
+            own = _platforms_of(step)
+            marks = own if own is not None else _platforms_of(section)
+            if marks is not None and want not in marks:
+                results.skip(step.get("title", "untitled"),
+                             f"platform {'/'.join(sorted(marks))}")
+                continue
             if _dispatch_step(step, workdir, results, args, override_flags, spec):
                 continue
             if args.verbose:
