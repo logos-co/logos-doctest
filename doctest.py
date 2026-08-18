@@ -355,12 +355,24 @@ def expand_vars(s):
     {release} attached to a github:owner/repo URL resolves per-repo (overrides
     win, else the global release tag); any other {release} uses the global tag.
     """
+    # `{{ext}}` renders as a LITERAL `{ext}`. Without an escape a spec cannot
+    # write a placeholder down -- which makes this tool unable to document
+    # itself, and bites hardest where it matters most: a `file:` step that
+    # authors an INNER spec has its content expanded by the OUTER run, so the
+    # inner spec receives the outer machine's value and the placeholder is gone
+    # before anything else can see it. Found by writing doctests/08, where the
+    # generated target script printed `lib.dylib` instead of `lib.dll`.
+    _ESC = "\x00DOCTEST_ESC\x00"
+    s = re.sub(r"\{\{(\w+)\}\}", lambda m: _ESC + m.group(1) + _ESC, s)
+
     s = s.replace("{ext}", LIB_EXT)
     s = s.replace("{exe}", EXE_SUFFIX)
     s = s.replace("{shared_flags}", SHARED_FLAGS)
     s = _GITHUB_RELEASE_RE.sub(
         lambda m: m.group(1) + _release_ref_for(m.group(2)), s)
     s = s.replace("{release}", RELEASE_TAG)
+
+    s = re.sub(_ESC + r"(\w+)" + _ESC, lambda m: "{" + m.group(1) + "}", s)
     return s
 
 

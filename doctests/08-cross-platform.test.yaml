@@ -1,0 +1,183 @@
+name: "Cross-platform runs: build here, run there"
+output: 08-cross-platform.md
+release: ""
+
+intro: |
+  Every tutorial so far assumed one machine runs the whole spec. Some do not fit
+  that: a cross-build tutorial *builds* on a machine with a toolchain and *runs*
+  the result somewhere else — a Windows box, a device, a container — where the
+  build tooling does not exist at all.
+
+  This one covers the three pieces that make that a single tutorial rather than
+  two disconnected ones: marking sections with `platform:`, generating a
+  standalone script for the platform that cannot run `doctest`, and merging the
+  legs into **one** report where every step shows the machine it actually ran on.
+
+what_you_build: "A two-platform spec, run as two separate legs, merged into a single execution report."
+
+what_you_learn:
+  - How `platform:` on a section or step selects which leg runs it
+  - Why `run` defaults to the host platform, so marking a spec breaks no existing job
+  - How `--results` writes the report's data as JSON instead of rendering it
+  - How `emit-smoke` produces a script that needs neither `doctest` nor nix
+  - How `assemble` turns that script's output back into a payload
+  - How `report a.json b.json` merges legs, labelling each record with its platform
+
+prerequisites:
+  - |
+    **Nix** with flakes enabled (see the first tutorial). The `doctest` flake
+    bundles everything else.
+
+sections:
+  - title: "Mark which platform each section belongs to"
+    step: true
+    text: |
+      A section (or an individual step) may declare `platform:` — a name, or a
+      list of them. A step with no mark, in a section with no mark, runs
+      **everywhere**; that is why adding marks to a spec never changes how any
+      existing one behaves.
+
+      The spec below has a build half that needs a toolchain and a run half that
+      only needs the artifact. In a real cross-build the first would be
+      `nix build …`; here it is a plain command so this tutorial stays fast.
+    steps:
+      - title: "Write a two-platform spec"
+        file:
+          path: crossbuild.test.yaml
+          language: yaml
+          content: |
+            name: "Cross-build demo"
+            output: crossbuild.md
+
+            sections:
+              - title: "Build the artifact"
+                step: true
+                platform: [linux, macos]
+                text: "Needs the toolchain, so it runs on the builder."
+                steps:
+                  - title: "Produce it"
+                    run: "printf 'payload\n' > artifact.txt"
+                  - title: "Confirm it exists"
+                    run: "cat artifact.txt"
+                    expect_contains: ["payload"]
+
+              - title: "Exercise it on the target"
+                step: true
+                platform: windows
+                text: "Only makes sense where the artifact runs."
+                steps:
+                  - title: "Run it"
+                    run: "echo 'ran on the target'"
+                    expect_contains: ["ran on the target"]
+                  - title: "Name the library it loads"
+                    run: "echo lib.{{ext}}"
+                    expect_contains: ["lib."]
+
+  - title: "Run the builder's leg"
+    step: true
+    text: |
+      `--platform` picks a leg. The steps belonging to the other one are reported
+      as `SKIP` with the reason, so a leg never quietly does less than it appears
+      to.
+
+      `--results` writes the report's **data** as JSON rather than rendering it.
+      That is the whole trick: rendering needs the spec and the execution
+      records, not the machine that produced them.
+
+      > Leaving `--platform` off is fine, and is what every existing CI job does.
+      > It then defaults to the host — `linux`, `macos` or `windows` — so a spec
+      > that gains marks keeps behaving sensibly with no workflow changes.
+    steps:
+      - title: "Run only the build half"
+        run: "nix run github:logos-co/logos-doctest{release} -- run crossbuild.test.yaml --platform linux --results build.json"
+        code_block: "doctest run crossbuild.test.yaml --platform linux --results build.json"
+        expect_contains:
+          - "SKIP"
+          - "platform windows"
+        post_text: "Two steps ran; the two marked `windows` were skipped by name."
+
+  - title: "Generate a script for the platform that cannot run doctest"
+    step: true
+    text: |
+      The target may have no nix, no Python, no `doctest` — only a shell. So
+      `emit-smoke` turns that platform's steps into a **standalone bash script**
+      which runs the commands, checks the same `expect_contains`, and writes its
+      execution records to a JSON file.
+
+      `--ext` and `--exe` resolve `{ext}` and `{exe}` for the target, so one spec
+      serves every platform: `{exe}` is empty on Unix and `.exe` for Windows.
+
+      > The inner spec above writes `{{ext}}`, doubled. A placeholder is expanded
+      > by whichever run *reads* it, so an unescaped `{ext}` in a `file:` step
+      > would be resolved by this outer tutorial — on the machine you are reading
+      > this from — and the inner spec would receive a fixed extension with no
+      > placeholder left for `--ext` to resolve. Doubling it renders one literal
+      > pair of braces, which is what the inner spec needs to see.
+    steps:
+      - title: "Emit the target's half"
+        run: "nix run github:logos-co/logos-doctest{release} -- emit-smoke crossbuild.test.yaml --platform windows --ext dll -o target.sh"
+        code_block: "doctest emit-smoke crossbuild.test.yaml --platform windows --ext dll -o target.sh"
+        expect_contains:
+          - "steps"
+        post_text: "Look at what it produced — plain shell, no dependency on this tool:"
+        extra_run:
+          run: "grep -E '^# --- |echo lib' target.sh"
+          code_block: "grep -E '^# --- ' target.sh"
+
+      - title: "Run it the way the target would"
+        text: |
+          Here we run it on this machine, because a tutorial cannot reach a second
+          one. In CI this is the step that executes on the real target — and
+          nothing about the script changes.
+        run: "EXECS_OUT=target-execs.json bash target.sh"
+        code_block: "EXECS_OUT=target-execs.json bash target.sh"
+        expect_contains:
+          - "ran on the target"
+          - "lib.dll"
+
+  - title: "Merge the legs into one report"
+    step: true
+    text: |
+      `assemble` pairs the script's records back with the spec — the script could
+      not render markdown, only report what it executed — and produces exactly
+      the payload `run --results` would have written.
+
+      Then `report` takes **any number** of payloads and merges them. Rows are
+      positional and every leg renders from the same spec, so merging is
+      concatenating each row's records. A step that neither leg skipped shows up
+      once per leg, each labelled with the platform that ran it.
+    steps:
+      - title: "Assemble the target's records"
+        run: "nix run github:logos-co/logos-doctest{release} -- assemble crossbuild.test.yaml target-execs.json -o target.json --platform-label windows-latest"
+        code_block: "doctest assemble crossbuild.test.yaml target-execs.json -o target.json --platform-label windows-latest"
+        expect_contains:
+          - "record(s)"
+
+      - title: "Merge both legs"
+        run: "nix run github:logos-co/logos-doctest{release} -- report build.json target.json -o merged.html"
+        code_block: "doctest report build.json target.json -o merged.html"
+        expect_contains:
+          - "windows-latest"
+        post_text: |
+          The report names both platforms, and every execution record inside
+          carries the one that produced it.
+        extra_run:
+          run: "grep -c 'windows-latest' merged.html"
+          code_block: "grep -c 'windows-latest' merged.html"
+
+  - title: "Recap"
+    text: |
+      | Piece | What it does |
+      |---|---|
+      | `platform:` on a section/step | Selects which leg runs it; unmarked runs everywhere |
+      | `run --platform NAME` | Executes one leg, `SKIP`ping the rest by name |
+      | `run --results PATH` | Writes the report's data as JSON instead of rendering |
+      | `emit-smoke --platform NAME` | A standalone script for a platform that cannot run this tool |
+      | `assemble SPEC EXECS -o PATH` | Turns that script's records into a payload |
+      | `report a.json b.json -o OUT` | Merges legs into one report, labelled per platform |
+
+      Two properties worth relying on. `run --report` and
+      `report --from-results` of the same run produce **byte-identical** HTML, so
+      where a report is rendered never changes what it says. And a payload with
+      no execution records is **refused** rather than rendered — it would look
+      like a complete tutorial that asserted nothing.
