@@ -3659,12 +3659,19 @@ def cmd_emit_smoke(args):
               f"`platform: linux` and the run sections `platform: "
               f"{args.platform}`.", file=sys.stderr)
     elif args.platform not in declared:
-        print(f"ERROR: {args.spec} names platform(s) "
-              f"{', '.join(sorted(declared))} but nothing for "
-              f"'{args.platform}'. Emitting every unmarked step under a name the "
-              f"spec never mentions would produce a script nobody intended.",
+        # A WARNING, not an error. A spec that marks only the half which cannot
+        # run everywhere -- `platform: [linux, macos]` on its nix build -- and
+        # leaves the rest unmarked is expressing exactly the right thing: those
+        # steps run on every platform, this one included. Refusing that made the
+        # common cross-build shape unusable, and the case the refusal was really
+        # aimed at (a typo like `--platform windoze`) is already caught below,
+        # where zero selected steps IS fatal.
+        print(f"  {yellow('WARNING')}: {args.spec} names platform(s) "
+              f"{', '.join(sorted(declared))} and nothing for "
+              f"'{args.platform}'. Emitting its unmarked steps, which run "
+              f"everywhere. If you meant a different platform, check the "
+              f"spelling -- nothing here would have caught it.",
               file=sys.stderr)
-        sys.exit(2)
 
     if not keys:
         print(f"ERROR: no steps select for platform '{args.platform}'. A script "
