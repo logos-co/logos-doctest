@@ -261,29 +261,72 @@ def _describe_ui_actions(tests):
         elif action == "set_text":
             detail = f"set {t.get('find_by','')}={t.get('find_value','')!r} to {t.get('value','')!r}"
         elif action == "set_property":
-            detail = f"set {t.get('find_by','')}={t.get('find_value','')!r} .{t.get('property','')} to {t.get('value','')!r}"
+            detail = f"set {t.get('find_by','objectName')}={t.get('find_value','')!r} .{t.get('property','')} to {t.get('value','')!r}"
         elif action == "expect_property":
-            detail = f"expect {t.get('find_by','')}={t.get('find_value','')!r} .{t.get('property','')} == {t.get('value','')!r}"
+            detail = f"expect {t.get('find_by','objectName')}={t.get('find_value','')!r} .{t.get('property','')} == {t.get('value','')!r}"
         elif action == "click_object":
-            detail = f"click {t.get('find_by','')}={t.get('find_value','')!r}"
+            detail = f"click {t.get('find_by','objectName')}={t.get('find_value','')!r}"
         elif action == "call_method":
             detail = f"call {t.get('find_value','')!r}.{t.get('method','')}({', '.join(map(repr, t.get('args', [])))})"
         elif action == "sleep":
-            detail = f"sleep {t.get('ms', 0)}ms"
+            detail = f"sleep {t.get('ms', 1000)}ms"
         else:
             detail = action
         lines.append(f"- {name + ': ' if name else ''}{detail}")
     return "\n".join(lines)
 
 
-def _rec_ui(step, launch_cmd, tests, status, note, output):
-    """Record a ui_test execution: the launch command, the action list, and the
-    captured output/log."""
+def _ui_action_results(tests, trace_path=None):
+    """Join spec labels to runtime evidence; absent actions were not run.
+
+    The generated driver updates a journal before and after each awaited
+    action (including its screenshot). A zero exit code alone is not evidence
+    that the requested actions completed.
+    """
+    trace, error = [], ""
+    if trace_path:
+        try:
+            with open(trace_path) as f:
+                trace = json.load(f)
+            if not isinstance(trace, list) or len(trace) > len(tests):
+                raise ValueError("invalid action journal length")
+            for i, entry in enumerate(trace):
+                if (not isinstance(entry, dict) or entry.get("index") != i
+                        or entry.get("status") not in ("pass", "fail", "running")
+                        or (i < len(trace) - 1 and entry["status"] != "pass")):
+                    raise ValueError("invalid action journal sequence")
+        except (OSError, ValueError) as exc:
+            trace, error = [], f"UI action evidence unavailable: {exc}"
+    actions = []
+    for i, t in enumerate(tests):
+        entry = trace[i] if i < len(trace) else {}
+        action = {
+            "index": i + 1,
+            "description": _describe_ui_actions([t])[2:],
+            "status": entry.get("status", "not_run"),
+        }
+        for key in ("duration_ms", "error"):
+            if key in entry:
+                action[key] = entry[key]
+        actions.append(action)
+    return actions, error
+
+
+def _ui_run_outcome(rc, tests, trace_path):
+    actions, error = _ui_action_results(tests, trace_path)
+    passed = rc == 0 and bool(actions) and all(a["status"] == "pass" for a in actions)
+    note = "" if passed else (error or "UI tests failed or did not complete all actions")
+    return passed, note, actions
+
+
+def _rec_ui(step, launch_cmd, tests, status, note, output, actions=None, runner_cmd=""):
+    """Keep commands separate from each action's observed execution result."""
     if not _REPORT:
         return
-    cmd = launch_cmd + "\n\n# test actions:\n" + _describe_ui_actions(tests)
-    _REPORT.record(step, kind="ui_test", cmd=cmd, status=status,
-                   output=output, note=note)
+    if actions is None:
+        actions, _ = _ui_action_results(tests)
+    _REPORT.record(step, kind="ui_test", cmd=launch_cmd, status=status,
+                   output=output, note=note, actions=actions, runner_cmd=runner_cmd)
 
 
 # ── Variable Expansion ────────────────────────────────────────────────────────
@@ -1419,7 +1462,8 @@ def _ui_action_md_blocks(ui_test_spec, images_dir=None):
     return blocks
 
 
-def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=None):
+def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=None,
+                       trace_path=None):
     """Generate a .mjs test file from YAML test actions for logos-qt-mcp.
 
     If an action carries a `screenshot:` field (a filename), the generated test
@@ -1428,12 +1472,36 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
     """
     import json as _json
 
+    supported = {"click", "expect_texts", "wait_for", "set_text", "set_property",
+                 "expect_property", "call_method", "click_object", "sleep"}
+    for i, t in enumerate(tests):
+        if t.get("action") not in supported:
+            raise ValueError(f"UI action {i + 1}: unsupported action {t.get('action')!r}")
+    trace_path = trace_path or output_path + ".actions.json"
     with open(output_path, "w") as f:
         f.write('import { resolve } from "node:path";\n')
         f.write('import { writeFileSync } from "node:fs";\n')
-        f.write(f'const qtMcpRoot = "{qt_mcp_path}";\n')
+        f.write(f'const qtMcpRoot = {_json.dumps(qt_mcp_path)};\n')
         f.write('const { test, run } = await import(resolve(qtMcpRoot, "test-framework/framework.mjs"));\n\n')
-        f.write(f'test("{test_name}", async (app) => {{\n')
+        f.write(f'const tracePath = {_json.dumps(trace_path)};\n')
+        f.write('const actions = [];\n')
+        f.write('const saveActions = () => writeFileSync(tracePath, JSON.stringify(actions));\n')
+        f.write('saveActions();\n')
+        f.write('async function uiAction(index, action) {\n')
+        f.write('  const entry = { index, status: "running" };\n')
+        f.write('  actions.push(entry); saveActions();\n')
+        f.write('  const started = Date.now();\n')
+        f.write('  try {\n')
+        f.write('    await action();\n')
+        f.write('    entry.status = "pass";\n')
+        f.write('  } catch (error) {\n')
+        f.write('    entry.status = "fail"; entry.error = String(error.message || error);\n')
+        f.write('    throw error;\n')
+        f.write('  } finally {\n')
+        f.write('    entry.duration_ms = Date.now() - started; saveActions();\n')
+        f.write('  }\n')
+        f.write('}\n\n')
+        f.write(f'test({_json.dumps(test_name)}, async (app) => {{\n')
 
         def emit_screenshot(t):
             fname = _screenshot_filename(t.get("screenshot", ""))
@@ -1450,11 +1518,12 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
             f.write(f'    }}\n')
             f.write(f'  }}\n')
 
-        for t in tests:
+        for i, t in enumerate(tests):
+            f.write(f'  await uiAction({i}, async () => {{\n')
             action = t.get("action", "")
             if action == "click":
                 target = t.get("target", "")
-                f.write(f'  await app.click("{target}", {{ exact: true }});\n')
+                f.write(f'  await app.click({_json.dumps(target)}, {{ exact: true }});\n')
             elif action == "expect_texts":
                 texts = _json.dumps(t.get("texts", []))
                 f.write(f'  await app.expectTexts({texts});\n')
@@ -1464,7 +1533,7 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 name = t.get("name", "")
                 f.write(f'  await app.waitFor(\n')
                 f.write(f'    async () => {{ await app.expectTexts({texts}); }},\n')
-                f.write(f'    {{ timeout: {timeout}, interval: 500, description: "{name}" }}\n')
+                f.write(f'    {{ timeout: {timeout}, interval: 500, description: {_json.dumps(name)} }}\n')
                 f.write(f'  );\n')
             elif action == "set_text":
                 prop = t.get("find_by", "")
@@ -1473,7 +1542,8 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 f.write(f'  {{\n')
                 f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
                 f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("set_text: element not found");\n')
-                f.write(f'    await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "text", value: "{set_val}" }});\n')
+                f.write(f'    const res = await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "text", value: {_json.dumps(set_val)} }});\n')
+                f.write('    if (res.error) throw new Error("set_text: " + res.error);\n')
                 f.write(f'  }}\n')
             elif action == "set_property":
                 # Like set_text, but writes a named property instead of only
@@ -1487,7 +1557,8 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 f.write(f'  {{\n')
                 f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
                 f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("set_property: element not found");\n')
-                f.write(f'    await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "{set_prop}", value: {set_val} }});\n')
+                f.write(f'    const res = await app.inspector.send("setProperty", {{ objectId: found.matches[0].id, property: "{set_prop}", value: {set_val} }});\n')
+                f.write('    if (res.error) throw new Error("set_property: " + res.error);\n')
                 f.write(f'  }}\n')
             elif action == "expect_property":
                 # Assert a named property's current value. Reads it back via
@@ -1531,13 +1602,15 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 f.write(f'  {{\n')
                 f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
                 f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("click_object: element not found");\n')
-                f.write(f'    await app.inspector.send("click", {{ objectId: found.matches[0].id }});\n')
+                f.write(f'    const res = await app.inspector.send("click", {{ objectId: found.matches[0].id }});\n')
+                f.write('    if (res.error) throw new Error("click_object: " + res.error);\n')
                 f.write(f'  }}\n')
             elif action == "sleep":
                 ms = t.get("ms", 1000)
                 f.write(f'  await new Promise(r => setTimeout(r, {ms}));\n')
 
             emit_screenshot(t)
+            f.write('  });\n')
 
         f.write('});\n\nrun();\n')
 
@@ -1647,11 +1720,20 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
     images_dir = _IMAGES_DIR or os.path.join(workdir, "images")
     os.makedirs(images_dir, exist_ok=True)
     test_name = f"{spec.get('name', 'tutorial')}: {title}"
-    mjs_path = generate_mjs_tests(
-        tests, qt_mcp, test_name,
-        os.path.join(workdir, "ui-test.mjs"),
-        images_dir=images_dir,
-    )
+    trace_path = os.path.join(workdir, "ui-test.actions.json")
+    # Never accept evidence from an earlier run in this workdir.
+    if os.path.exists(trace_path):
+        os.remove(trace_path)
+    try:
+        mjs_path = generate_mjs_tests(
+            tests, qt_mcp, test_name,
+            os.path.join(workdir, "ui-test.mjs"),
+            images_dir=images_dir, trace_path=trace_path,
+        )
+    except ValueError as exc:
+        _rec_ui(step, "", tests, "fail", str(exc), "")
+        results.fail(title, str(exc))
+        return
 
     launch_cmd = ui_spec.get("launch", "")
 
@@ -1750,13 +1832,14 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
             print(f"  Running UI tests ({len(tests)} actions)...")
             cmd = f'node "{mjs_path}" --verbose'
             rc, output = run_cmd(cmd, workdir, verbose, capture=True, timeout=120)
-            if rc == 0:
-                _rec_ui(step, launch_cmd, tests, "pass", "", output)
+            passed, note, actions = _ui_run_outcome(rc, tests, trace_path)
+            if passed:
+                _rec_ui(step, launch_cmd, tests, "pass", "", output, actions, cmd)
                 results.pass_(title)
             else:
-                _rec_ui(step, launch_cmd, tests, "fail", "UI tests failed",
-                        (output or "") + "\n\n--- app log ---\n" + _app_log_tail())
-                results.fail(title, "UI tests failed")
+                _rec_ui(step, launch_cmd, tests, "fail", note,
+                        (output or "") + "\n\n--- app log ---\n" + _app_log_tail(), actions, cmd)
+                results.fail(title, note)
                 trimmed = output.strip()[-800:] if output else "(no output)"
                 print(f"        {dim(trimmed)}")
                 _dump_app_log("app output during test run")
@@ -1813,12 +1896,13 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
         cmd = f'{env_prefix} node "{mjs_path}" --ci "{binary_path}" --verbose'
         print(f"  Running UI tests ({len(tests)} actions)...")
         rc, output = run_cmd(cmd, workdir, verbose, capture=True, timeout=120)
-        if rc == 0:
-            _rec_ui(step, cmd, tests, "pass", "", output)
+        passed, note, actions = _ui_run_outcome(rc, tests, trace_path)
+        if passed:
+            _rec_ui(step, cmd, tests, "pass", "", output, actions)
             results.pass_(title)
         else:
-            _rec_ui(step, cmd, tests, "fail", "UI tests failed", output)
-            results.fail(title, "UI tests failed")
+            _rec_ui(step, cmd, tests, "fail", note, output, actions)
+            results.fail(title, note)
             trimmed = output.strip()[-800:] if output else "(no output)"
             print(f"        {dim(trimmed)}")
 
@@ -2788,6 +2872,11 @@ _REPORT_HTML_TEMPLATE = r"""<!DOCTYPE html>
   .badge.pass { background: rgba(46,160,67,.15); color: var(--pass); }
   .badge.fail { background: rgba(248,81,73,.15); color: var(--fail); }
   .badge.info { background: rgba(210,153,34,.15); color: var(--info); }
+  .badge.not_run { background: var(--bg); color: var(--muted); white-space: nowrap; }
+  .badge.running { background: rgba(248,81,73,.15); color: var(--fail); }
+  .ui-actions { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
+  .ui-actions td { padding: 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .ui-actions td:last-child { white-space: nowrap; color: var(--muted); }
   .kind { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
   .note { color: var(--muted); font-size: 12.5px; margin-bottom: 6px; }
   pre.cmd { background: var(--code-bg); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; padding: 10px 12px; margin: 0 0 6px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
@@ -2857,6 +2946,21 @@ _REPORT_HTML_TEMPLATE = r"""<!DOCTYPE html>
     let h = `<div class="exec"><div class="exec-head">${badge}${kind}</div>`;
     if (e.note) h += `<div class="note">${escapeHtml(e.note)}</div>`;
     if (e.cmd) h += `<pre class="cmd">${escapeHtml(e.cmd)}</pre>`;
+    if (e.runner_cmd) h += `<pre class="cmd">${escapeHtml(e.runner_cmd)}</pre>`;
+    if (e.actions) {
+      const passed = e.actions.filter(a => a.status === "pass").length;
+      h += `<div class="kind">UI actions: ${passed}/${e.actions.length} passed</div>`;
+      h += `<table class="ui-actions"><tbody>`;
+      for (const a of e.actions) {
+        const label = a.status === "not_run" ? "NOT RUN" :
+          a.status === "running" ? "INTERRUPTED" : a.status.toUpperCase();
+        h += `<tr><td>${a.index}</td><td><span class="badge ${a.status}">${label}</span></td>`;
+        h += `<td>${escapeHtml(a.description)}`;
+        if (a.error) h += `<div class="note">${escapeHtml(a.error)}</div>`;
+        h += `</td><td>${a.duration_ms !== undefined ? a.duration_ms + " ms" : ""}</td></tr>`;
+      }
+      h += `</tbody></table>`;
+    }
     const out = (e.output || "").trim();
     if (out) {
       const long = out.split("\n").length > 12;

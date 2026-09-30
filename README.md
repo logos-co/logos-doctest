@@ -133,6 +133,13 @@ It covers every step type (file writes, shell commands, `check_file`, and headle
 `ui_test` runs). Pair it with `--continue-on-fail` so the report captures the whole
 run instead of stopping at the first failure — ideal for publishing from CI.
 
+For UI tests, commands and action results are shown separately. Each action's
+badge comes from the running driver: **Pass**, **Fail**, **Interrupted**, or
+**Not run**. An action passes after its operation and optional screenshot
+complete. Later actions remain **Not run** after a failure. The UI test only
+passes when every action has recorded a pass; a successful process exit alone
+is insufficient. Unknown action names are rejected before launching the app.
+
 When a run includes multiple specs, the report's tutorial picker is deep-linkable:
 append `#<tutorial-slug>` to the report URL (slug = lowercase name with non-alphanumerics
 replaced by hyphens) to open a specific tutorial directly.
