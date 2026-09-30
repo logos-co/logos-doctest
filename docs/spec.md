@@ -214,6 +214,15 @@ Two modes:
 | `call_method` | `find_by` (default `objectName`), `find_value`, `method`, `args` (list) | Find element by property and invoke a method on it. Use to drive slots that text/property writes can't trigger (e.g. selecting a combobox entry so its `activated` signal fires). |
 | `sleep` | `ms` | Wait a fixed duration |
 
+Unknown action names are errors, not ignored steps. The generated driver records
+each action as it starts and completes. The execution report shows its status
+and duration separately from the launch and driver commands. A failed assertion,
+inspector rejection, or screenshot marks that action **Fail**; subsequent actions
+are **Not run**. A driver that exits during an action shows **Interrupted**.
+Passing the UI test requires successful runtime evidence for every action.
+The journal is saved as `ui-test.actions.json` in the workdir and included in
+the `--results` payload, so the report can be rendered elsewhere.
+
 Any action may also carry an optional **`screenshot`** field (a filename, e.g.
 `screenshot: "result.png"`). After that action runs, the runner captures the
 headless app via the qt-mcp `app.screenshot()` API and writes the PNG to an
@@ -563,7 +572,7 @@ It records every executed action type:
 | `file`    | the path written and a pass/fail marker (contents already shown on the left) |
 | `run` / `extra_run` | the expanded command, exit code, and combined stdout/stderr (both the command and its `(verify)` continuation appear) |
 | `check_file` | the glob checked and which file matched |
-| `ui_test` | the launch command, the list of UI test actions, and the framework output (plus the app log tail on failure) |
+| `ui_test` | the launch and driver commands, observed per-action statuses and durations, and framework output (plus the app log tail on failure) |
 
 The dropdown at the top of the report switches between specs. It is populated whenever the report holds more than one spec, which happens two ways: a `requires:` chain (every tutorial in the chain is included), or passing **several specs to one `run`** (`doctest run a.test.yaml b.test.yaml --report out.html`). The latter is how a repo with multiple independent `*.test.yaml` files publishes a single combined CI report — one dropdown entry per spec — instead of a separate HTML file each. Markdown is rendered client-side via [marked.js](https://marked.js.org/) loaded from a CDN, so viewing the report needs network access on first open.
 

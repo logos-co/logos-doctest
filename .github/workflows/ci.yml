@@ -52,6 +52,14 @@ jobs:
       - name: Unit-test flag injection around a `--`
         run: nix develop .# --command python3 tests/test_inject_double_dash.py
 
+      - name: Setup Node for UI execution regression tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify UI actions execute and failures cannot pass
+        run: nix develop .# --command python3 tests/test_ui_execution.py
+
       - name: Run the example spec end-to-end
         run: nix run .# -- run examples/hello.test.yaml --verbose
 
