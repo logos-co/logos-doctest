@@ -52,6 +52,11 @@ jobs:
       - name: Unit-test flag injection around a `--`
         run: nix develop .# --command python3 tests/test_inject_double_dash.py
 
+      # A generated Windows script ran a multi-line step twice (its header
+      # comment covered one line) and a step's `set -e` killed the rest.
+      - name: Unit-test emit-smoke step isolation
+        run: nix develop .# --command python3 tests/test_emit_smoke.py
+
       - name: Setup Node for UI execution regression tests
         uses: actions/setup-node@v4
         with:
