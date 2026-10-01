@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -48,6 +49,96 @@ def _load_engine():
 
 
 dt = _load_engine()
+
+
+class CommandTimeoutOutput(unittest.TestCase):
+    """Warm builds and UI drivers must retain progress when they time out."""
+
+    def test_captured_timeout_preserves_partial_output(self):
+        for captured, expected in (
+                (b"last action\n", "last action\ncommand timed out"),
+                (b"last action", "last action\ncommand timed out"),
+                (b"partial \xe2\x82", "partial \ufffd\ncommand timed out"),
+                ("text output", "text output\ncommand timed out"),
+                (None, "command timed out"),
+                (b"", "command timed out")):
+            with self.subTest(captured=captured):
+                error = subprocess.TimeoutExpired("fixture", 1, output=captured)
+                with mock.patch("locale.getpreferredencoding", return_value="utf-8"), \
+                        mock.patch.object(dt.subprocess, "run", side_effect=error):
+                    self.assertEqual(
+                        dt.run_cmd("fixture", ROOT, capture=True, timeout=1),
+                        (124, expected))
+
+    def test_uncaptured_timeout_keeps_existing_diagnostic(self):
+        error = subprocess.TimeoutExpired("fixture", 1)
+        with mock.patch.object(dt.subprocess, "run", side_effect=error):
+            self.assertEqual(dt.run_cmd("fixture", ROOT, timeout=1),
+                             (124, "command timed out"))
+
+    def test_real_timeout_keeps_merged_stdout_and_stderr(self):
+        # exec makes Python the direct child, so subprocess.run kills/reaps it.
+        script = ("import os, time; "
+                  "os.write(1, b'last stdout action\\n'); "
+                  "os.write(2, b'last stderr action\\n'); time.sleep(30)")
+        command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        code, output = dt.run_cmd(command, ROOT, capture=True, timeout=1)
+        self.assertEqual(code, 124)
+        self.assertEqual(output, "last stdout action\nlast stderr action\n"
+                                 "command timed out")
+
+    def test_completed_commands_preserve_output_and_exit_code(self):
+        for code in (0, 7):
+            with self.subTest(code=code):
+                command = f"printf 'completed output'; exit {code}"
+                self.assertEqual(dt.run_cmd(command, ROOT, capture=True, timeout=5),
+                                 (code, "completed output"))
+
+    def test_timeout_uses_text_encoding_and_normalizes_newlines(self):
+        for encoding in ("utf-8", "cp1252"):
+            with self.subTest(encoding=encoding):
+                error = subprocess.TimeoutExpired(
+                    "fixture", 1, output="caf\u00e9\r\nnext\rline\r".encode(encoding))
+                with mock.patch("locale.getpreferredencoding", return_value=encoding), \
+                        mock.patch.object(dt.subprocess, "run", side_effect=error):
+                    self.assertEqual(
+                        dt.run_cmd("fixture", ROOT, capture=True, timeout=1),
+                        (124, "caf\u00e9\nnext\nline\ncommand timed out"))
+
+    def test_real_completion_and_timeout_share_text_decoding(self):
+        for encoding in ("utf-8", "cp1252"):
+            with self.subTest(encoding=encoding):
+                raw = "caf\u00e9\r\nnext\rline\r".encode(encoding)
+                script = f"import os, time; os.write(1, {raw!r})"
+                outputs = []
+                # Emulate a locale without requiring it to be installed.
+                with mock.patch("locale.getpreferredencoding", return_value=encoding), \
+                        mock.patch("locale.getencoding", return_value=encoding):
+                    for suffix in ("", "; time.sleep(30)"):
+                        command = (f"exec {shlex.quote(sys.executable)} -c "
+                                   f"{shlex.quote(script + suffix)}")
+                        outputs.append(dt.run_cmd(command, ROOT, capture=True, timeout=1))
+                self.assertEqual(outputs[0], (0, "caf\u00e9\nnext\nline\n"))
+                self.assertEqual(outputs[1], (124, outputs[0][1] + "command timed out"))
+
+    def test_completed_invalid_bytes_keep_existing_decode_failure(self):
+        script = "import os; os.write(1, b'\\xff')"
+        command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        with mock.patch("locale.getpreferredencoding", return_value="utf-8"):
+            code, output = dt.run_cmd(command, ROOT, capture=True, timeout=5)
+        self.assertEqual(code, 1)
+        self.assertIn("decode", output)
+
+    def test_default_encoding_tracks_python_utf8_mode(self):
+        encoding = "utf-8" if sys.flags.utf8_mode else "cp1252"
+        raw = "caf\u00e9\r\n".encode(encoding)
+        script = f"import os, time; os.write(1, {raw!r}); time.sleep(30)"
+        command = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        # UTF-8 mode must take precedence over a non-UTF-8 locale; otherwise
+        # subprocess's existing locale default must be preserved.
+        with mock.patch("locale.getencoding", return_value="cp1252"):
+            self.assertEqual(dt.run_cmd(command, ROOT, capture=True, timeout=1),
+                             (124, "caf\u00e9\ncommand timed out"))
 
 
 # A flake with NO inputs: instant to evaluate, nothing to fetch. `packages`

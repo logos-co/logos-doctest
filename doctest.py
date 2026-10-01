@@ -52,6 +52,7 @@ import base64
 import collections
 import glob
 import json
+import locale
 import os
 import platform
 import re
@@ -939,6 +940,9 @@ def run_cmd(cmd, workdir, verbose=False, capture=False, timeout=None):
         actual_cmd = cmd.rstrip().rstrip("&") + " >/dev/null 2>&1 &"
 
     try:
+        # Match text=True's default, including Python's UTF-8 mode, and keep
+        # the same encoding available when TimeoutExpired returns raw bytes.
+        encoding = locale.getpreferredencoding(False)
         if capture:
             result = subprocess.run(
                 actual_cmd,
@@ -947,6 +951,7 @@ def run_cmd(cmd, workdir, verbose=False, capture=False, timeout=None):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding=encoding,
                 timeout=timeout,
             )
             return result.returncode, result.stdout or ""
@@ -958,8 +963,16 @@ def run_cmd(cmd, workdir, verbose=False, capture=False, timeout=None):
                 timeout=timeout,
             )
             return result.returncode, ""
-    except subprocess.TimeoutExpired:
-        return 124, "command timed out"
+    except subprocess.TimeoutExpired as exc:
+        output = exc.output or ""
+        # TimeoutExpired carries bytes even with text=True; the timeout can
+        # also interrupt a multibyte character. stderr is already merged above.
+        if isinstance(output, bytes):
+            output = output.decode(encoding, errors="replace")
+        output = output.replace("\r\n", "\n").replace("\r", "\n")
+        if output and not output.endswith("\n"):
+            output += "\n"
+        return 124, output + "command timed out"
     except Exception as e:
         return 1, str(e)
 
