@@ -22,6 +22,9 @@ export function test(name, fn) { callback = fn; }
 export async function run() {
   const state = { text: 'initial', enabled: true };
   let finds = 0, reads = 0;
+  // SHOTS: comma-separated base64 images returned in order; the last repeats.
+  const shots = (process.env.SHOTS || 'aW1hZ2U=').split(',');
+  let shotIndex = 0;
   const app = {
     click: async (target) => log(['click', target]),
     expectTexts: async (texts) => {
@@ -39,7 +42,8 @@ export async function run() {
     },
     screenshot: async () => {
       log(['screenshot']);
-      return process.env.BAD_SCREENSHOT ? {} : { image: 'aW1hZ2U=' };
+      if (process.env.BAD_SCREENSHOT) return {};
+      return { image: shots[Math.min(shotIndex++, shots.length - 1)] };
     },
     inspector: { send: async (command, args) => {
       log([command, args]);
@@ -163,6 +167,54 @@ class UIExecution(unittest.TestCase):
         self.assertFalse(passed)
         self.assertEqual(actions[0]['status'], 'fail')
         self.assertIn('no image', actions[0]['error'])
+
+    def shot_calls(self):
+        return [c for c in map(json.loads, self.calls.read_text().splitlines())
+                if c[0] == 'screenshot']
+
+    def test_repeated_screenshot_is_retaken_until_it_changes(self):
+        # 'image', then a stale 'image' once more, then 'other'.
+        proc, passed, note, actions = self.execute([
+            {'action': 'sleep', 'ms': 1, 'screenshot': 'first.png'},
+            {'action': 'click', 'target': 'Next', 'screenshot': 'second.png'},
+        ], SHOTS='aW1hZ2U=,aW1hZ2U=,b3RoZXI=')
+        self.assertTrue(passed, note)
+        self.assertEqual(len(self.shot_calls()), 3)
+        self.assertEqual((self.root / 'second.png').read_bytes(), b'other')
+        self.assertIn('second.png: matched first.png, re-took it 1x', proc.stdout)
+
+    def test_screenshot_identical_to_the_previous_one_fails(self):
+        _, passed, _, actions = self.execute([
+            {'action': 'sleep', 'ms': 1, 'screenshot': 'first.png'},
+            {'action': 'click', 'target': 'Next', 'screenshot': 'second.png'},
+            {'action': 'sleep', 'ms': 1},
+        ])
+        self.assertFalse(passed)
+        self.assertEqual([a['status'] for a in actions], ['pass', 'fail', 'not_run'])
+        self.assertIn('second.png: identical to first.png', actions[1]['error'])
+        self.assertGreater(len(self.shot_calls()), 2)
+        self.assertFalse((self.root / 'second.png').exists())
+
+    def test_allowed_unchanged_screenshot_passes_without_retakes(self):
+        _, passed, note, _ = self.execute([
+            {'action': 'sleep', 'ms': 1, 'screenshot': 'first.png'},
+            {'action': 'click', 'target': 'Next', 'screenshot': 'again.png',
+             'allow_unchanged_screenshot': True},
+        ])
+        self.assertTrue(passed, note)
+        self.assertEqual(len(self.shot_calls()), 2)
+        self.assertEqual((self.root / 'again.png').read_bytes(), b'image')
+
+    def test_repeat_with_no_ui_action_between_is_not_compared(self):
+        _, passed, note, _ = self.execute([
+            {'action': 'click', 'target': 'Open', 'screenshot': 'first.png'},
+            {'action': 'wait_for', 'texts': ['Ready']},
+            {'action': 'expect_property', 'find_value': 'field', 'property': 'enabled',
+             'value': True},
+            {'action': 'sleep', 'ms': 1, 'screenshot': 'settled.png'},
+        ])
+        self.assertTrue(passed, note)
+        self.assertEqual(len(self.shot_calls()), 2)
 
     def test_inspector_rejection_is_not_reported_as_success(self):
         for action in ('set_text', 'set_property', 'click_object'):
