@@ -3604,6 +3604,12 @@ def steps_for_platform(spec, platform):
 _UNAME_RE = re.compile(r"\buname\b")
 
 
+def _header(text):
+    """First line only: every further line of a `# ---` header would run as code."""
+    lines = (text or "").strip().split("\n")
+    return lines[0] + (" …" if len(lines) > 1 else "")
+
+
 def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
     """Bash that runs `keys` and writes a positional exec-record JSON."""
     steps = dict(iter_spec_steps(spec))
@@ -3668,7 +3674,7 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
             path = file_spec["path"]
             content = (file_spec.get("content", "") or "").replace("{ext}", ext).replace("{exe}", exe)
             w("")
-            w(f"# --- {key}  {title}  (write {path})")
+            w(f"# --- {key}  {_header(title)}  (write {path})")
             w(f'mkdir -p "$(dirname {shlex.quote(path)})"')
             if file_spec.get("encoding") == "base64":
                 w(f'printf %s {shlex.quote(content)} | base64 -d > {shlex.quote(path)}')
@@ -3711,12 +3717,14 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
                     f"and Windows ships bsdtar as tar.exe. Measured: it makes an "
                     f"lgx package fail to load. Add --format=ustar.")
             w("")
-            w(f"# --- {key}  {title or cmd}")
+            w(f"# --- {key}  {_header(title or cmd)}")
             w('_o=$(mktemp)')
-            w("{")
+            # A subshell, as doctest runs each step in its own shell: a step's
+            # `set -e`, `cd` or `exit` must not reach the steps after it.
+            w("(")
             for line in cmd.rstrip("\n").split("\n"):
                 w("  " + line)
-            w('} >"$_o" 2>&1; _rc=$?')
+            w(') >"$_o" 2>&1; _rc=$?')
             w('cat "$_o"')
             if expects:
                 w('if [ "$_rc" -eq 0 ]; then')
@@ -3735,7 +3743,7 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
         if pattern:
             pattern = pattern.replace("{ext}", ext).replace("{exe}", exe)
             w("")
-            w(f"# --- {key}  check_file: {pattern}")
+            w(f"# --- {key}  check_file: {_header(pattern)}")
             w('_o=$(mktemp)')
             w(f'if compgen -G {shlex.quote(pattern)} > "$_o"; then _rc=0; else '
               f'_rc=1; echo "no match: {pattern}" > "$_o"; fi')
