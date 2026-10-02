@@ -23,9 +23,12 @@ doctest runs every step in its own shell, so a generated script must too.
 Run with:  python3 tests/test_emit_smoke.py
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -77,6 +80,39 @@ QUOTING_SPEC = {
     }],
 }
 
+# check_file fixtures, one per edge case. The odd name holds `"`, `$` and backticks.
+CHECK_FILE_SETUP = ("mkdir -p 'my dir' dots empty && touch exists.txt .hidden dots/.x '[ab]' "
+                    "'my dir/a b.txt' 'odd \"$q`x`.txt' && ln -s nowhere dangling")
+
+# What doctest run's glob.glob reports for each pattern; every bash must agree.
+CHECK_FILE_CASES = [
+    ("exists.txt", "pass"),
+    ("missing.txt", "fail"),         # no glob characters: comes back unchanged
+    ("my dir/*.txt", "pass"),
+    ('odd "$q`x`.txt', "pass"),      # data, never expanded
+    ("dangling", "pass"),            # lstat, as glob.glob
+    ("dangl*", "pass"),
+    ("*hidden", "fail"),             # `*` skips dotfiles
+    (".hid*", "pass"),
+    ("dots/*", "fail"),
+    ("empty/.*", "fail"),            # bash < 5.2 globs `.` and `..`
+    ("empty/.", "pass"),             # ...but named literally, `.` counts
+    ("[ab]", "fail"),                # a glob matching nothing, though a file has its name
+    ("$(touch subst)`touch tick`*", "fail"),
+]
+
+CHECK_FILE_SPEC = {
+    "name": "emit-smoke check_file",
+    "sections": [{
+        "title": "Steps",
+        "steps": [{"run": CHECK_FILE_SETUP}] + [{"check_file": p} for p, _ in CHECK_FILE_CASES],
+    }],
+}
+
+# Each distinct bash here: nixpkgs' has no compgen, macOS /bin/bash is 3.2.
+BASHES = sorted({os.path.realpath(b) for b in (shutil.which("bash"), "/bin/bash")
+                 if b and os.path.exists(b)})
+
 HEREDOC_SPEC = {
     "name": "emit-smoke heredoc",
     "sections": [{
@@ -125,13 +161,13 @@ KILLED_SPEC = {
 }
 
 
-def _emit_and_run(spec):
+def _emit_and_run(spec, bash="bash"):
     keys = [key for key, _ in ENGINE.iter_spec_steps(spec)]
     script, _ = ENGINE.emit_smoke_script(spec, "isolation.test.yaml", "so", "linux", keys)
     work = tempfile.mkdtemp()
     with open(os.path.join(work, "smoke.sh"), "w") as handle:
         handle.write(script)
-    proc = subprocess.run(["bash", "smoke.sh"], cwd=work, capture_output=True, text=True,
+    proc = subprocess.run([bash, "smoke.sh"], cwd=work, capture_output=True, text=True,
                           env={**os.environ, "EXECS_OUT": "execs.json"})
     return work, script, proc
 
@@ -227,6 +263,39 @@ class EmitSmokeQuoting(unittest.TestCase):
     def test_nothing_in_a_message_runs(self):
         self.assertFalse(os.path.exists(os.path.join(self.work, "subst")))
         self.assertFalse(os.path.exists(os.path.join(self.work, "tick")))
+
+
+class EmitSmokeCheckFile(unittest.TestCase):
+    """check_file passes iff its glob matches an existing path, as in doctest run, under
+    every bash here. It used `compgen -G`, which nixpkgs' bash lacks: every check failed."""
+
+    def test_table_is_what_doctest_run_reports(self):
+        work = tempfile.mkdtemp()
+        subprocess.run(["bash", "-c", CHECK_FILE_SETUP], cwd=work, check=True)
+        results = ENGINE.Results(fail_fast=False)
+        native = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            for pattern, _ in CHECK_FILE_CASES:
+                passed = results.passed
+                ENGINE.handle_check_file({"check_file": pattern}, work, results, False)
+                native.append((pattern, "pass" if results.passed > passed else "fail"))
+        self.assertEqual(native, CHECK_FILE_CASES)
+
+    def test_every_bash_agrees(self):
+        self.assertTrue(BASHES)
+        for bash in BASHES:
+            with self.subTest(bash=bash):
+                work, _, proc = _emit_and_run(CHECK_FILE_SPEC, bash)
+                records = _records(work)
+                self.assertEqual(records["0.0"], ("pass", 0), proc.stdout)
+                self.assertEqual([(pattern, records[f"0.{i}"][0])
+                                  for i, (pattern, _) in enumerate(CHECK_FILE_CASES, start=1)],
+                                 CHECK_FILE_CASES, proc.stdout)
+                execs = json.loads(_read(work, "execs.json"))
+                self.assertEqual(execs["0.3"][0]["output"], "my dir/a b.txt\n")
+                self.assertEqual(execs["0.2"][0]["output"], "no match: missing.txt\n")
+                self.assertFalse(os.path.exists(os.path.join(work, "subst")))
+                self.assertFalse(os.path.exists(os.path.join(work, "tick")))
 
 
 class EmitSmokeVerbatimCommand(unittest.TestCase):

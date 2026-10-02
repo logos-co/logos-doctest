@@ -3679,6 +3679,19 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
     w("_fin() { [ -z \"$_key\" ] || printf ']' >> \"$EXECS_OUT\"; printf '}' >> \"$EXECS_OUT\"; }")
     w("trap _fin EXIT")
     w("")
+    # Not `compgen -G`: nixpkgs' bash is built without it.
+    if any(steps[key].get("check_file") for key in keys):
+        w("# check_file: print the paths a glob matches, as doctest run's glob.glob does (by lstat).")
+        w("_glob() (  # $1 pattern")
+        w("  IFS=; shopt -s nullglob; rc=1")
+        w("  for f in $1; do")
+        w('    case $f in "$1") ;; .|..|*/.|*/..) continue ;; esac  # bash < 5.2 globs . and ..')
+        w("    # A word with no glob characters comes back unchanged, so test that it exists.")
+        w('    if [ -e "$f" ] || [ -L "$f" ]; then printf \'%s\\n\' "$f"; rc=0; fi')
+        w("  done")
+        w('  exit "$rc"')
+        w(")")
+        w("")
     w("rc_all=0")
 
     for key in keys:
@@ -3767,7 +3780,7 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
             w("")
             w(f"# --- {key}  check_file: {_header(pattern)}")
             w('_o=$(mktemp)')
-            w(f'if compgen -G {shlex.quote(pattern)} > "$_o"; then _rc=0; else '
+            w(f'if _glob {shlex.quote(pattern)} > "$_o"; then _rc=0; else '
               f'_rc=1; echo {shlex.quote("no match: " + pattern)} > "$_o"; fi')
             w('cat "$_o"')
             w(f'_rec {shlex.quote(key)} {shlex.quote("check file: " + pattern)} '
