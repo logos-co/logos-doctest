@@ -107,9 +107,11 @@ sections:
       `--ext` and `--exe` resolve `{ext}` and `{exe}` for the target, so one spec
       serves every platform: `{exe}` is empty on Unix and `.exe` for Windows.
 
-      The script cannot run a `ui_test` yet. One selected for the target is
-      recorded as **failed** rather than left out, so a leg never passes a UI
-      test it did not run: mark it for the platforms that can run it.
+      A `ui_test` runs there too, the way `doctest run` runs it: the app starts
+      headless, the script waits for its inspector, drives it with Node and
+      records each action. The target needs `node`, and the step a `launch:`
+      command and a `qt_mcp:` directory that exist there. A `ui_test` it cannot
+      run is recorded as **failed**, never left out.
 
       > The inner spec above writes `{{ext}}`, doubled. A placeholder is expanded
       > by whichever run *reads* it, so an unescaped `{ext}` in a `file:` step

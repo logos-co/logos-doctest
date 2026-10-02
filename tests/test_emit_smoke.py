@@ -34,10 +34,13 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 import yaml
@@ -196,10 +199,10 @@ PARSE_ERROR_SPEC = {
     }],
 }
 
-# Step 0.1 is a UI test the script cannot run. Step 0.3 has `run:`, so doctest run runs
-# that and never reaches its ui_test.
-UI_TEST_SPEC = {
-    "name": "emit-smoke ui_test",
+# UI tests the script cannot run: 0.1 has no qt_mcp, 0.4 no launch (binary mode), 0.5 an
+# unknown action. Step 0.3 has `run:`, so doctest run runs that and never reaches its ui_test.
+UI_REFUSED_SPEC = {
+    "name": "emit-smoke ui_test refused",
     "sections": [{
         "title": "Steps",
         "steps": [
@@ -210,23 +213,112 @@ UI_TEST_SPEC = {
             {"run": "echo after"},
             {"run": "echo run wins", "ui_test": {
                 "launch": "./app/bin/app{exe}", "tests": [{"action": "sleep", "ms": 1}]}},
+            {"title": "Binary mode", "ui_test": {
+                "binary": "app{exe}", "qt_mcp": "qtmcp", "tests": [{"action": "sleep", "ms": 1}]}},
+            {"title": "Misspelled action", "ui_test": {
+                "launch": "./app", "qt_mcp": "qtmcp", "tests": [{"action": "expect_proprety"}]}},
         ],
     }],
 }
+
+# An app for the generated ui_test to drive: it listens on FAKE_PORT and has a child, so
+# teardown must stop a tree. FAKE_DIE exits first; FAKE_SILENT never listens.
+FAKE_APP = r'''
+import os, socket, subprocess, sys, time
+print("fake app dying" if os.environ.get("FAKE_DIE") else "fake app up", flush=True)
+if os.environ.get("FAKE_DIE"):
+    sys.exit(3)
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+with open("app.pids", "w") as handle:
+    handle.write("%d %d\n" % (os.getpid(), child.pid))
+if os.environ.get("FAKE_SILENT"):
+    time.sleep(600)
+server = socket.socket()
+server.bind(("127.0.0.1", int(os.environ["FAKE_PORT"])))
+server.listen(5)
+while True:
+    server.accept()[0].close()
+'''
+
+# Stands in for logos-qt-mcp's test framework: the text "Ready" is on screen.
+FAKE_FRAMEWORK = '''
+let callback;
+export function test(name, fn) { callback = fn; }
+export async function run() {
+  const app = {
+    expectTexts: async (texts) => {
+      if (texts.join() !== "Ready") throw new Error("Expected texts not found: " + JSON.stringify(texts));
+    },
+    waitFor: async (fn) => fn(),
+    screenshot: async () => ({ image: Buffer.from("png").toString("base64") }),
+  };
+  try { await callback(app); }
+  catch (error) { console.error(error.message); process.exitCode = 1; }
+}
+'''
+
+# The fake app's interpreter, spelled for a bash command line.
+PYTHON = shlex.quote(sys.executable.replace("\\", "/"))
+
+
+def _ui_spec(port, launch_env="", tests=None, **ui):
+    """One ui_test step driving FAKE_APP on `port`; `ui` overrides its keys."""
+    tests = tests or [{"name": "ready", "action": "wait_for", "texts": ["Ready"]},
+                      {"name": "shot", "action": "sleep", "ms": 1, "screenshot": "shot.png"}]
+    return {"name": "emit-smoke ui_test", "sections": [{"title": "Steps", "steps": [
+        {"title": "Drive the fake app", "ui_test": {
+            "launch": f"{launch_env}FAKE_PORT={port} {PYTHON} fake_app.py",
+            "qt_mcp": "qtmcp", "inspector_port": port, "launch_timeout": 30,
+            "tests": tests, **ui}}]}]}
+
+
+def _free_port():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _port_open(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _alive(pid):
+    if os.name == "nt":  # os.kill(pid, 0) would TerminateProcess it
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
 
 STRICT = ("-euo", "pipefail")  # how logos-windows-ci runs a generated script
 NOT_RUN = "not run: the script stopped before this command finished\n"
 
 
-def _emit_and_run(spec, bash=BASH, flags=()):
+def _emit_and_run(spec, bash=BASH, flags=(), work=None, env=None):
     keys = [key for key, _ in ENGINE.iter_spec_steps(spec)]
     script, _ = ENGINE.emit_smoke_script(spec, "isolation.test.yaml", "so", "linux", keys)
-    work = tempfile.mkdtemp()
+    work = work or tempfile.mkdtemp()
     # LF, as emit-smoke writes it on Linux: bash reads a CR as part of the line.
     with open(os.path.join(work, "smoke.sh"), "w", encoding="utf-8", newline="\n") as handle:
         handle.write(script)
-    proc = subprocess.run([bash, *flags, "smoke.sh"], cwd=work, capture_output=True, text=True,
-                          env={**os.environ, "EXECS_OUT": "execs.json"})
+    proc = subprocess.run([bash, *flags, "smoke.sh"], cwd=work, capture_output=True,
+                          encoding="utf-8", errors="replace",
+                          env={**os.environ, "EXECS_OUT": "execs.json", **(env or {})})
     return work, script, proc
 
 
@@ -433,7 +525,7 @@ class EmitSmokeStrictInvocation(unittest.TestCase):
     def test_records_match_plain_bash(self):
         specs = {"isolation": SPEC, "quoting": QUOTING_SPEC, "heredoc": HEREDOC_SPEC,
                  "records": RECORDS_SPEC, "check_file": CHECK_FILE_SPEC, "options": OPTIONS_SPEC,
-                 "ui_test": UI_TEST_SPEC}
+                 "ui_test": UI_REFUSED_SPEC}
         for bash in BASHES:
             for name, spec in specs.items():
                 with self.subTest(bash=bash, spec=name):
@@ -486,50 +578,186 @@ class EmitSmokeStoppedEarly(unittest.TestCase):
         self.assertEqual(steps, [["pass", "fail"], ["fail"]])
 
 
-class EmitSmokeUiTest(unittest.TestCase):
-    """A script cannot run a ui_test yet, so it records the step as failed instead of
-    leaving it out, and the steps around it still run."""
+class EmitSmokeUiTestRefused(unittest.TestCase):
+    """A ui_test the script cannot run is recorded as failed, with the reason, instead of
+    left out; nothing is launched and the steps around it still run."""
 
     def test_recorded_as_failed(self):
         for bash in BASHES:
             for flags in ((), STRICT):
                 with self.subTest(bash=bash, flags=flags):
-                    work, _, proc = _emit_and_run(UI_TEST_SPEC, bash, flags)
+                    work, _, proc = _emit_and_run(UI_REFUSED_SPEC, bash, flags)
                     self.assertEqual(_all_records(work), {
                         "0.0": [("run", "pass", 0)],
                         "0.1": [("ui_test", "fail", None)],
                         "0.2": [("run", "pass", 0)],
                         "0.3": [("run", "pass", 0)],
-                    }, proc.stdout)
+                        "0.4": [("ui_test", "fail", None)],
+                        "0.5": [("ui_test", "fail", None)],
+                    }, proc.stdout + proc.stderr)
                     self.assertEqual(proc.returncode, 1)
-                    record = json.loads(_read(work, "execs.json"))["0.1"][0]
-                    self.assertEqual(record["cmd"], "./app/bin/app --user-dir ./data")
-                    self.assertTrue(record["output"].startswith("not run: "), record["output"])
+                    execs = json.loads(_read(work, "execs.json"))
+                    notes = {key: execs[key][0]["note"] for key in ("0.1", "0.4", "0.5")}
+                    self.assertIn("qt_mcp:", notes["0.1"])
+                    self.assertIn("launch:", notes["0.4"])
+                    self.assertIn("UI action 1: unsupported action 'expect_proprety'", notes["0.5"])
+                    for key, note in notes.items():
+                        self.assertTrue(note.startswith("not run: "), note)
+                        self.assertEqual([a["status"] for a in execs[key][0]["actions"]],
+                                         ["not_run"])
+                    self.assertEqual(execs["0.1"][0]["cmd"], "./app/bin/app --user-dir ./data")
+                    self.assertEqual(execs["0.4"][0]["cmd"], "app")
                     self.assertIn("::error::0.1 Drive the app: not run: ", proc.stdout)
+                    self.assertFalse(os.path.exists(os.path.join(work, "ui-test-app.log")))
 
-    def test_warns_for_that_step_only(self):
-        keys = [key for key, _ in ENGINE.iter_spec_steps(UI_TEST_SPEC)]
-        _, warnings = ENGINE.emit_smoke_script(UI_TEST_SPEC, "ui.test.yaml", "dll", "windows",
+    def test_warns_for_those_steps(self):
+        keys = [key for key, _ in ENGINE.iter_spec_steps(UI_REFUSED_SPEC)]
+        _, warnings = ENGINE.emit_smoke_script(UI_REFUSED_SPEC, "ui.test.yaml", "dll", "windows",
                                                keys, ".exe")
-        self.assertEqual(len(warnings), 1, warnings)
-        self.assertIn("step 0.1 ('Drive the app') is a ui_test", warnings[0])
+        self.assertEqual([w.split(")")[0] for w in warnings],
+                         ["step 0.1 ('Drive the app'", "step 0.4 ('Binary mode'",
+                          "step 0.5 ('Misspelled action'"])
+        self.assertTrue(all("is a ui_test the script cannot run" in w for w in warnings))
 
     def test_strict_refuses_to_emit(self):
         work = tempfile.mkdtemp()
         with open(os.path.join(work, "ui.test.yaml"), "w") as handle:
-            yaml.safe_dump(UI_TEST_SPEC, handle)
+            yaml.safe_dump(UI_REFUSED_SPEC, handle)
         proc = subprocess.run([sys.executable, os.path.join(ROOT, "doctest.py"), "emit-smoke",
                                "ui.test.yaml", "--platform", "windows", "--strict", "-o", "s.sh"],
                               cwd=work, capture_output=True, text=True)
         self.assertEqual(proc.returncode, 3, proc.stderr)
-        self.assertIn("is a ui_test", proc.stderr)
+        self.assertIn("is a ui_test the script cannot run", proc.stderr)
 
-    def test_assemble_counts_it_as_failed(self):
-        work, _, _ = _emit_and_run(UI_TEST_SPEC)
-        proc, steps = _assemble(work, UI_TEST_SPEC, "execs.json")
+    def test_assemble_counts_them_as_failed(self):
+        work, _, _ = _emit_and_run(UI_REFUSED_SPEC)
+        proc, steps = _assemble(work, UI_REFUSED_SPEC, "execs.json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("(4 record(s), 3 passed, 1 failed)", proc.stdout)
-        self.assertEqual(steps, [["pass"], ["fail"], ["pass"], ["pass"]])
+        self.assertIn("(6 record(s), 3 passed, 3 failed)", proc.stdout)
+        self.assertEqual(steps, [["pass"], ["fail"], ["pass"], ["pass"], ["fail"], ["fail"]])
+
+
+@unittest.skipUnless(shutil.which("node"), "a ui_test runs its driver with Node")
+class EmitSmokeUiTestRuns(unittest.TestCase):
+    """The script runs a ui_test as doctest run does: launch, wait for the inspector, drive
+    with node, record each action, then stop the app's whole process tree."""
+
+    def fixture(self):
+        work = tempfile.mkdtemp()
+        with open(os.path.join(work, "fake_app.py"), "w") as handle:
+            handle.write(FAKE_APP)
+        framework = os.path.join(work, "qtmcp", "test-framework")
+        os.makedirs(framework)
+        with open(os.path.join(framework, "framework.mjs"), "w") as handle:
+            handle.write(FAKE_FRAMEWORK)
+        self.addCleanup(self.kill_leftovers, work)
+        return work
+
+    @staticmethod
+    def pids(work):
+        try:
+            return [int(pid) for pid in _read(work, "app.pids").split()]
+        except OSError:
+            return []
+
+    def kill_leftovers(self, work):
+        for pid in self.pids(work):
+            if _alive(pid):
+                os.kill(pid, 9)
+
+    def alive_after_run(self, work):
+        """The fake app's processes still alive after a few seconds' grace."""
+        deadline = time.time() + 5
+        while time.time() < deadline and any(_alive(pid) for pid in self.pids(work)):
+            time.sleep(0.2)
+        return [pid for pid in self.pids(work) if _alive(pid)]
+
+    def run_spec(self, spec, bash=BASH, flags=()):
+        work = self.fixture()
+        _, _, proc = _emit_and_run(spec, bash, flags, work=work)
+        return work, proc, json.loads(_read(work, "execs.json"))["0.0"][0]
+
+    def test_passes_and_stops_the_app_tree(self):
+        for bash in BASHES:
+            for flags in ((), STRICT):
+                with self.subTest(bash=bash, flags=flags):
+                    port = _free_port()
+                    work, proc, rec = self.run_spec(_ui_spec(port), bash, flags)
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertEqual((rec["kind"], rec["status"], rec["note"]),
+                                     ("ui_test", "pass", ""), rec)
+                    self.assertEqual([a["status"] for a in rec["actions"]], ["pass", "pass"])
+                    self.assertEqual(rec["runner_cmd"], 'node "ui-test.mjs" --verbose')
+                    with open(os.path.join(work, "images", "shot.png"), "rb") as handle:
+                        self.assertEqual(handle.read(), b"png")
+                    self.assertEqual(len(self.pids(work)), 2)
+                    self.assertEqual(self.alive_after_run(work), [])
+                    self.assertFalse(_port_open(port))
+
+    def test_failed_action_fails_the_step(self):
+        port = _free_port()
+        work, proc, rec = self.run_spec(_ui_spec(port, tests=[
+            {"name": "missing", "action": "wait_for", "texts": ["Missing"]}]))
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual((rec["status"], rec["note"]),
+                         ("fail", "UI tests failed or did not complete all actions"))
+        self.assertEqual(rec["actions"][0]["status"], "fail")
+        self.assertIn('Expected texts not found: ["Missing"]', rec["actions"][0]["error"])
+        self.assertIn("--- app log ---\nfake app up", rec["output"])
+        self.assertIn("::error::0.0 Drive the fake app: UI tests failed", proc.stdout)
+        self.assertEqual(self.alive_after_run(work), [])
+
+    def test_app_that_exits_before_its_inspector(self):
+        port = _free_port()
+        _, proc, rec = self.run_spec(_ui_spec(port, launch_env="FAKE_DIE=1 "))
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(rec["note"],
+                         f"app exited (code 3) before inspector opened on port {port}")
+        self.assertEqual(rec["output"], "fake app dying")
+        self.assertEqual([a["status"] for a in rec["actions"]], ["not_run", "not_run"])
+
+    def test_inspector_that_never_opens(self):
+        port = _free_port()
+        work, proc, rec = self.run_spec(
+            _ui_spec(port, launch_env="FAKE_SILENT=1 ", launch_timeout=2))
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(rec["note"], f"inspector not available on port {port} after 2s")
+        self.assertEqual(len(self.pids(work)), 2)
+        self.assertEqual(self.alive_after_run(work), [])
+
+    def test_failing_setup_stops_before_launch(self):
+        work, proc, rec = self.run_spec(
+            _ui_spec(_free_port(), setup=["echo preparing", "echo broken; exit 4"]))
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual((rec["note"], rec["output"]),
+                         ("setup command failed: echo broken; exit 4", "broken\n"))
+        self.assertIn("preparing", proc.stdout)
+        self.assertFalse(os.path.exists(os.path.join(work, "app.pids")))
+
+    def test_busy_port_refuses_to_launch(self):
+        port = _free_port()
+        with socket.socket() as holder:
+            holder.bind(("127.0.0.1", port))
+            holder.listen(1)
+            work, proc, rec = self.run_spec(_ui_spec(port))
+        self.assertEqual(proc.returncode, 1)
+        self.assertTrue(rec["note"].startswith(f"port {port} was in use before launch"), rec)
+        self.assertFalse(os.path.exists(os.path.join(work, "app.pids")))
+
+    def test_missing_qt_mcp_directory(self):
+        _, _, rec = self.run_spec(_ui_spec(_free_port(), qt_mcp="nowhere"))
+        self.assertEqual(rec["note"], "logos-qt-mcp not found: nowhere")
+
+    def test_assemble_keeps_the_actions(self):
+        spec = _ui_spec(_free_port())
+        work, _, _ = self.run_spec(spec)
+        proc, steps = _assemble(work, spec, "execs.json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(steps, [["pass"]])
+        payload = json.loads(_read(work, "results.json"))
+        rec = [r for t in payload["tutorials"] for row in t["rows"] for r in row.get("execs", [])][0]
+        self.assertEqual([a["description"] for a in rec["actions"]],
+                         ["ready: wait for ['Ready']", "shot: sleep 1ms"])
 
 
 if __name__ == "__main__":
