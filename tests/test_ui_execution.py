@@ -21,6 +21,7 @@ let callback;
 export function test(name, fn) { callback = fn; }
 export async function run() {
   const state = { text: 'initial', enabled: true };
+  let finds = 0, reads = 0;
   const app = {
     click: async (target) => log(['click', target]),
     expectTexts: async (texts) => {
@@ -28,17 +29,28 @@ export async function run() {
       if (process.env.INTERRUPT) process.exit(0);
       if (texts.join() !== 'Ready') throw new Error('text not found');
     },
-    waitFor: async (fn) => { log(['wait']); await fn(); },
+    // Polls like qt-mcp's waitFor, but counts attempts instead of sleeping.
+    waitFor: async (fn, opts = {}) => {
+      log(['wait', opts]);
+      for (let i = Math.floor(opts.timeout / opts.interval); i > 0; i--) {
+        try { return await fn(); } catch {}
+      }
+      return fn();
+    },
     screenshot: async () => {
       log(['screenshot']);
       return process.env.BAD_SCREENSHOT ? {} : { image: 'aW1hZ2U=' };
     },
     inspector: { send: async (command, args) => {
       log([command, args]);
-      if (command === 'findByProperty') return { matches: [{ id: 1 }] };
-      if (command === 'getProperties') return {
-        properties: Object.entries(state).map(([name, value]) => ({name, value}))
-      };
+      // MISSING_FINDS: element absent for that many lookups (view still loading).
+      if (command === 'findByProperty')
+        return ++finds <= Number(process.env.MISSING_FINDS || 0) ? { matches: [] } : { matches: [{ id: 1 }] };
+      // SETTLE_AFTER_READS: `enabled` turns false only after that many reads.
+      if (command === 'getProperties') {
+        if (++reads > Number(process.env.SETTLE_AFTER_READS || Infinity)) state.enabled = false;
+        return { properties: Object.entries(state).map(([name, value]) => ({name, value})) };
+      }
       if (command === 'setProperty') {
         if (process.env.RPC_ERROR) return { error: 'write rejected' };
         state[args.property] = args.value;
@@ -113,6 +125,37 @@ class UIExecution(unittest.TestCase):
         self.assertEqual([a['status'] for a in actions], ['pass', 'fail', 'not_run'])
         self.assertIn('expected false got true', actions[1]['error'])
         self.assertNotIn('setProperty', self.calls.read_text())
+
+    def calls_made(self):
+        return [json.loads(line) for line in self.calls.read_text().splitlines()]
+
+    def test_expect_property_with_timeout_polls_until_it_holds(self):
+        # The element is missing at first, then its value has not settled yet.
+        tests = [{'action': 'expect_property', 'find_value': 'field', 'property': 'enabled',
+                  'value': False, 'timeout': 2000}]
+        _, passed, note, _ = self.execute(tests, MISSING_FINDS='1', SETTLE_AFTER_READS='2')
+        self.assertTrue(passed, note)
+        calls = self.calls_made()
+        self.assertEqual((calls[0][0], calls[0][1]['timeout'], calls[0][1]['interval']),
+                         ('wait', 2000, 500))
+        self.assertEqual([c[0] for c in calls].count('getProperties'), 3)
+
+    def test_expect_property_without_timeout_reads_once(self):
+        tests = [{'action': 'expect_property', 'find_value': 'field', 'property': 'enabled',
+                  'value': False}]
+        _, passed, _, actions = self.execute(tests, SETTLE_AFTER_READS='1')
+        self.assertFalse(passed)
+        self.assertIn('expected false got true', actions[0]['error'])
+        self.assertEqual([c[0] for c in self.calls_made()], ['findByProperty', 'getProperties'])
+
+    def test_expect_property_timeout_reports_the_last_mismatch(self):
+        tests = [{'action': 'expect_property', 'find_value': 'field', 'property': 'enabled',
+                  'value': False, 'timeout': 1000}]
+        _, passed, _, actions = self.execute(tests)
+        self.assertFalse(passed)
+        self.assertIn('expected false got true', actions[0]['error'])
+        # Two polls in 1000 ms at 500 ms, then the final read that reports.
+        self.assertEqual([c[0] for c in self.calls_made()].count('getProperties'), 3)
 
     def test_screenshot_failure_fails_its_action(self):
         _, passed, _, actions = self.execute(
