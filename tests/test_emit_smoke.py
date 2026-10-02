@@ -262,12 +262,13 @@ PYTHON = shlex.quote(sys.executable.replace("\\", "/"))
 
 
 def _ui_spec(port, launch_env="", tests=None, **ui):
-    """One ui_test step driving FAKE_APP on `port`; `ui` overrides its keys."""
+    """One ui_test step driving FAKE_APP on `port`; `ui` overrides its keys. It launches
+    through `env`, as specs do: on Windows that MSYS exec leaves a dead parent in the tree."""
     tests = tests or [{"name": "ready", "action": "wait_for", "texts": ["Ready"]},
                       {"name": "shot", "action": "sleep", "ms": 1, "screenshot": "shot.png"}]
     return {"name": "emit-smoke ui_test", "sections": [{"title": "Steps", "steps": [
         {"title": "Drive the fake app", "ui_test": {
-            "launch": f"{launch_env}FAKE_PORT={port} {PYTHON} fake_app.py",
+            "launch": f"env {launch_env}FAKE_PORT={port} {PYTHON} fake_app.py",
             "qt_mcp": "qtmcp", "inspector_port": port, "launch_timeout": 30,
             "tests": tests, **ui}}]}]}
 
@@ -693,6 +694,15 @@ class EmitSmokeUiTestRuns(unittest.TestCase):
                     self.assertEqual(len(self.pids(work)), 2)
                     self.assertEqual(self.alive_after_run(work), [])
                     self.assertFalse(_port_open(port))
+
+    def test_stops_an_app_bash_starts_itself(self):
+        port = _free_port()
+        spec = _ui_spec(port)
+        spec["sections"][0]["steps"][0]["ui_test"]["launch"] = f"FAKE_PORT={port} {PYTHON} fake_app.py"
+        work, proc, rec = self.run_spec(spec)
+        self.assertEqual((rec["status"], rec["note"]), ("pass", ""), proc.stdout)
+        self.assertEqual(self.alive_after_run(work), [])
+        self.assertFalse(_port_open(port))
 
     def test_failed_action_fails_the_step(self):
         port = _free_port()
