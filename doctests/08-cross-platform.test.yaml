@@ -111,7 +111,8 @@ sections:
       headless, the script waits for its inspector, drives it with Node and
       records each action. The target needs `node`, and the step a `launch:`
       command and a `qt_mcp:` directory that exist there. A `ui_test` it cannot
-      run is recorded as **failed**, never left out.
+      run is recorded as **failed**, never left out. Screenshots land in
+      `images/` and each step's app log in `ui-test-logs/`.
 
       > The inner spec above writes `{{ext}}`, doubled. A placeholder is expanded
       > by whichever run *reads* it, so an unescaped `{ext}` in a `file:` step
@@ -179,7 +180,7 @@ sections:
       | `run --platform NAME` | Executes one leg, `SKIP`ping the rest by name |
       | `run --results PATH` | Writes the report's data as JSON instead of rendering |
       | `emit-smoke --platform NAME` | A standalone script for a platform that cannot run this tool |
-      | `assemble SPEC EXECS -o PATH` | Turns that script's records into a payload |
+      | `assemble SPEC EXECS -o PATH` | Turns that script's records into a payload; `--images-dir images` inlines its screenshots |
       | `report a.json b.json -o OUT` | Merges legs into one report, labelled per platform |
 
       Two properties worth relying on. `run --report` and

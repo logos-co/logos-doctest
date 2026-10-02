@@ -345,12 +345,12 @@ def _bash_n(work):
     return subprocess.run([BASH, "-n", "smoke.sh"], cwd=work, capture_output=True, text=True)
 
 
-def _assemble(work, spec, execs_name):
+def _assemble(work, spec, execs_name, *extra):
     """`doctest assemble` on a records file: (process, per-step statuses in the payload)."""
     with open(os.path.join(work, "spec.test.yaml"), "w") as handle:
         yaml.safe_dump(spec, handle)
     proc = subprocess.run([sys.executable, os.path.join(ROOT, "doctest.py"), "assemble",
-                           "spec.test.yaml", execs_name, "-o", "results.json"],
+                           "spec.test.yaml", execs_name, "-o", "results.json", *extra],
                           cwd=work, capture_output=True, text=True)
     if proc.returncode:
         return proc, None
@@ -609,7 +609,7 @@ class EmitSmokeUiTestRefused(unittest.TestCase):
                     self.assertEqual(execs["0.1"][0]["cmd"], "./app/bin/app --user-dir ./data")
                     self.assertEqual(execs["0.4"][0]["cmd"], "app")
                     self.assertIn("::error::0.1 Drive the app: not run: ", proc.stdout)
-                    self.assertFalse(os.path.exists(os.path.join(work, "ui-test-app.log")))
+                    self.assertFalse(os.path.exists(os.path.join(work, "ui-test-logs")))
 
     def test_warns_for_those_steps(self):
         keys = [key for key, _ in ENGINE.iter_spec_steps(UI_REFUSED_SPEC)]
@@ -714,6 +714,7 @@ class EmitSmokeUiTestRuns(unittest.TestCase):
         self.assertEqual(rec["actions"][0]["status"], "fail")
         self.assertIn('Expected texts not found: ["Missing"]', rec["actions"][0]["error"])
         self.assertIn("--- app log ---\nfake app up", rec["output"])
+        self.assertIn("fake app up", _read(work, os.path.join("ui-test-logs", "0.0.log")))
         self.assertIn("::error::0.0 Drive the fake app: UI tests failed", proc.stdout)
         self.assertEqual(self.alive_after_run(work), [])
 
@@ -768,6 +769,19 @@ class EmitSmokeUiTestRuns(unittest.TestCase):
         rec = [r for t in payload["tutorials"] for row in t["rows"] for r in row.get("execs", [])][0]
         self.assertEqual([a["description"] for a in rec["actions"]],
                          ["ready: wait for ['Ready']", "shot: sleep 1ms"])
+        self.assertIn("](images/shot.png)", json.dumps(payload))
+
+    def test_assemble_inlines_the_screenshots(self):
+        spec = _ui_spec(_free_port())
+        work, _, _ = self.run_spec(spec)
+        proc, steps = _assemble(work, spec, "execs.json", "--images-dir", "images")
+        self.assertEqual((proc.returncode, steps), (0, [["pass"]]), proc.stderr)
+        payload = json.dumps(json.loads(_read(work, "results.json")))
+        self.assertIn("](data:image/png;base64,cG5n)", payload)  # b"png"
+        self.assertNotIn("](images/shot.png)", payload)
+        proc, _ = _assemble(work, spec, "execs.json", "--images-dir", "nowhere")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--images-dir nowhere is not a directory", proc.stderr)
 
 
 if __name__ == "__main__":

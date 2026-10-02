@@ -3752,7 +3752,8 @@ BASH, RECORD = sys.argv[1:3]
 CFG = json.load(sys.stdin)
 WINDOWS = os.name == "nt"
 PORT = int(CFG["port"])
-DRIVER, TRACE, APP_LOG = "ui-test.mjs", "ui-test.actions.json", "ui-test-app.log"
+DRIVER, TRACE = "ui-test.mjs", "ui-test.actions.json"
+APP_LOG = os.path.join("ui-test-logs", CFG["key"] + ".log")  # one per step, all kept
 RUNNER_CMD = 'node "%s" --verbose' % DRIVER
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -3961,6 +3962,7 @@ def run():
     group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | 0x4} if WINDOWS
              else {"start_new_session": True})
     say("  Launching: " + CFG["launch"])
+    os.makedirs(os.path.dirname(APP_LOG), exist_ok=True)
     with open(APP_LOG, "wb") as log:
         app = subprocess.Popen(bash_file("ui-test-launch.sh", CFG["launch"]),
                                stdin=subprocess.DEVNULL, stdout=log,
@@ -4364,8 +4366,15 @@ def cmd_assemble(args):
     positionally. This pairs those back with the spec and produces exactly the
     payload `run --results` would have.
     """
+    global _IMAGES_DIR
     import json as _json
     spec, spec_path = load_spec_for_emit(args.spec)
+    if args.images_dir:
+        # The script's ui_test screenshots, inlined into the payload as `run --report` does.
+        if not os.path.isdir(args.images_dir):
+            print(f"ERROR: --images-dir {args.images_dir} is not a directory.", file=sys.stderr)
+            sys.exit(2)
+        _IMAGES_DIR = os.path.abspath(args.images_dir)
     try:
         with open(args.execs_json) as f:
             execs = _json.load(f, object_pairs_hook=merge_repeated_keys)
@@ -4595,6 +4604,9 @@ def main():
     asm_parser.add_argument("-o", "--output", required=True, metavar="PATH")
     asm_parser.add_argument("--platform-label", default=None, metavar="NAME",
                             help="Platform recorded in the payload (e.g. windows-latest)")
+    asm_parser.add_argument("--images-dir", default=None, metavar="DIR",
+                            help="Where the script's ui_test steps wrote their screenshots "
+                                 "(its images/); they are inlined into the payload")
 
     # ── report ────────────────────────────────────────────────────────────
     report_parser = subparsers.add_parser(
