@@ -209,7 +209,7 @@ Two modes:
 | `expect_texts` | `texts` | Assert all texts are visible now |
 | `set_text` | `find_by`, `find_value`, `value` | Find element by property and set its `text` property |
 | `set_property` | `find_by` (default `objectName`), `find_value`, `property`, `value` | Find element by property and set a named property (any type), not just `text` like `set_text`. |
-| `expect_property` | `find_by` (default `objectName`), `find_value`, `property`, `value` | Find element by property and assert a named property equals `value` (compared JSON-encoded, so bools/numbers/strings all work). Asserts UI state, not just text presence. |
+| `expect_property` | `find_by` (default `objectName`), `find_value`, `property`, `value`, `timeout` (ms, optional) | Find element by property and assert a named property equals `value` (compared JSON-encoded, so bools/numbers/strings all work). Asserts UI state, not just text presence. Without `timeout` it reads once. With it, a missing element or a value that has not settled yet is retried every 500 ms until `timeout`, and then the last failure is reported. |
 | `click_object` | `find_by` (default `objectName`), `find_value` | Click an element found by property rather than visible text. Synthesizes a real mouse click at the item's position; use for buttons/areas with no text label. |
 | `call_method` | `find_by` (default `objectName`), `find_value`, `method`, `args` (list) | Find element by property and invoke a method on it. Use to drive slots that text/property writes can't trigger (e.g. selecting a combobox entry so its `activated` signal fires). |
 | `sleep` | `ms` | Wait a fixed duration |

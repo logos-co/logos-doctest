@@ -1565,18 +1565,27 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 # getProperties (response shape: { properties: [{name,value},...] })
                 # and compares JSON-encoded values, so bools, numbers and strings
                 # all work. Lets specs assert UI state, not just text presence.
+                # With `timeout` (ms) it polls like wait_for; without, one read.
                 prop = t.get("find_by", "objectName")
                 val = t.get("find_value", "")
                 check_prop = t.get("property", "")
                 expected = _json.dumps(t.get("value", ""))
-                f.write(f'  {{\n')
+                timeout = t.get("timeout")
+                if timeout is None:
+                    f.write(f'  {{\n')
+                else:
+                    f.write(f'  await app.waitFor(async () => {{\n')
                 f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
                 f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("expect_property: element not found");\n')
                 f.write(f'    const info = await app.inspector.send("getProperties", {{ objectId: found.matches[0].id }});\n')
                 f.write(f'    const entry = (info.properties || []).find(p => p.name === "{check_prop}");\n')
                 f.write(f'    if (!entry) throw new Error("expect_property: no property {check_prop}");\n')
                 f.write(f'    if (JSON.stringify(entry.value) !== JSON.stringify({expected})) throw new Error("expect_property {check_prop}: expected " + JSON.stringify({expected}) + " got " + JSON.stringify(entry.value));\n')
-                f.write(f'  }}\n')
+                if timeout is None:
+                    f.write(f'  }}\n')
+                else:
+                    name = _json.dumps(t.get("name", ""))
+                    f.write(f'  }}, {{ timeout: {timeout}, interval: 500, description: {name} }});\n')
             elif action == "call_method":
                 # Find an object by property (default objectName) and invoke a
                 # method on it via the inspector's callMethod RPC. Unlike `click`
