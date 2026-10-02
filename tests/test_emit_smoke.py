@@ -24,6 +24,7 @@ Bugs these guard against, found running real specs on Windows:
 doctest runs every step in its own shell, so a generated script must too.
 
 Run with:  python3 tests/test_emit_smoke.py
+CI also runs it on windows-latest, in the Git for Windows bash the scripts run in.
 """
 
 import contextlib
@@ -83,9 +84,13 @@ QUOTING_SPEC = {
     }],
 }
 
+# Git for Windows' `ln -s` copies, so it cannot make a dangling link: no such rows there.
+SYMLINKS = os.name != "nt"
+
 # check_file fixtures, one per edge case. The odd name holds `"`, `$` and backticks.
 CHECK_FILE_SETUP = ("mkdir -p 'my dir' dots empty && touch exists.txt .hidden dots/.x '[ab]' "
-                    "'my dir/a b.txt' 'odd \"$q`x`.txt' && ln -s nowhere dangling")
+                    "'my dir/a b.txt' 'odd \"$q`x`.txt'"
+                    + (" && ln -s nowhere dangling" if SYMLINKS else ""))
 
 # What doctest run's glob.glob reports for each pattern; every bash must agree.
 CHECK_FILE_CASES = [
@@ -93,8 +98,6 @@ CHECK_FILE_CASES = [
     ("missing.txt", "fail"),         # no glob characters: comes back unchanged
     ("my dir/*.txt", "pass"),
     ('odd "$q`x`.txt', "pass"),      # data, never expanded
-    ("dangling", "pass"),            # lstat, as glob.glob
-    ("dangl*", "pass"),
     ("*hidden", "fail"),             # `*` skips dotfiles
     (".hid*", "pass"),
     ("dots/*", "fail"),
@@ -103,6 +106,8 @@ CHECK_FILE_CASES = [
     ("[ab]", "fail"),                # a glob matching nothing, though a file has its name
     ("$(touch subst)`touch tick`*", "fail"),
 ]
+if SYMLINKS:  # lstat, as glob.glob
+    CHECK_FILE_CASES += [("dangling", "pass"), ("dangl*", "pass")]
 
 CHECK_FILE_SPEC = {
     "name": "emit-smoke check_file",
@@ -112,9 +117,10 @@ CHECK_FILE_SPEC = {
     }],
 }
 
+# Resolved on PATH: on Windows a bare "bash" can start System32's WSL launcher instead.
+BASH = shutil.which("bash") or "bash"
 # Each distinct bash here: nixpkgs' has no compgen, macOS /bin/bash is 3.2.
-BASHES = sorted({os.path.realpath(b) for b in (shutil.which("bash"), "/bin/bash")
-                 if b and os.path.exists(b)})
+BASHES = sorted({os.path.realpath(b) for b in (BASH, "/bin/bash") if os.path.exists(b)})
 
 HEREDOC_SPEC = {
     "name": "emit-smoke heredoc",
@@ -192,11 +198,12 @@ STRICT = ("-euo", "pipefail")  # how logos-windows-ci runs a generated script
 NOT_RUN = "not run: the script stopped before this command finished\n"
 
 
-def _emit_and_run(spec, bash="bash", flags=()):
+def _emit_and_run(spec, bash=BASH, flags=()):
     keys = [key for key, _ in ENGINE.iter_spec_steps(spec)]
     script, _ = ENGINE.emit_smoke_script(spec, "isolation.test.yaml", "so", "linux", keys)
     work = tempfile.mkdtemp()
-    with open(os.path.join(work, "smoke.sh"), "w") as handle:
+    # LF, as emit-smoke writes it on Linux: bash reads a CR as part of the line.
+    with open(os.path.join(work, "smoke.sh"), "w", encoding="utf-8", newline="\n") as handle:
         handle.write(script)
     proc = subprocess.run([bash, *flags, "smoke.sh"], cwd=work, capture_output=True, text=True,
                           env={**os.environ, "EXECS_OUT": "execs.json"})
@@ -222,7 +229,7 @@ def _all_records(work):
 
 
 def _bash_n(work):
-    return subprocess.run(["bash", "-n", "smoke.sh"], cwd=work, capture_output=True, text=True)
+    return subprocess.run([BASH, "-n", "smoke.sh"], cwd=work, capture_output=True, text=True)
 
 
 def _assemble(work, spec, execs_name):
@@ -266,7 +273,8 @@ class EmitSmokeIsolation(unittest.TestCase):
         self.assertNotEqual(self.proc.returncode, 0)
 
     def test_cd_does_not_carry_over(self):
-        self.assertEqual(self.read("where.txt").strip(), os.path.realpath(self.work))
+        # Under `sub` the file would be missing here. Git Bash spells pwd /c/..., hence basename.
+        self.assertEqual(os.path.basename(self.read("where.txt").strip()), os.path.basename(self.work))
 
 
 class EmitSmokeQuoting(unittest.TestCase):
@@ -307,9 +315,10 @@ class EmitSmokeCheckFile(unittest.TestCase):
     """check_file passes iff its glob matches an existing path, as in doctest run, under
     every bash here. It used `compgen -G`, which nixpkgs' bash lacks: every check failed."""
 
+    @unittest.skipIf(os.name == "nt", "doctest run does not run on Windows")
     def test_table_is_what_doctest_run_reports(self):
         work = tempfile.mkdtemp()
-        subprocess.run(["bash", "-c", CHECK_FILE_SETUP], cwd=work, check=True)
+        subprocess.run([BASH, "-c", CHECK_FILE_SETUP], cwd=work, check=True)
         results = ENGINE.Results(fail_fast=False)
         native = []
         with contextlib.redirect_stdout(io.StringIO()):
