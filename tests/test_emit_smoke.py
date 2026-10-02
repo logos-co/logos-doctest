@@ -17,10 +17,14 @@ Bugs these guard against, found running real specs on Windows:
 - A step with several records (file/run/extra_run/check_file) wrote its key once
   per record. json.load keeps the last, so a failing `run:` before a passing
   `extra_run:` assembled as a pass.
+- logos-windows-ci runs the script as `bash -euo pipefail`. Its errexit ended the
+  script at the first failing step, before that step's record, so the records
+  left behind all passed.
 
 doctest runs every step in its own shell, so a generated script must too.
 
 Run with:  python3 tests/test_emit_smoke.py
+CI also runs it on windows-latest, in the Git for Windows bash the scripts run in.
 """
 
 import contextlib
@@ -80,9 +84,13 @@ QUOTING_SPEC = {
     }],
 }
 
+# Git for Windows' `ln -s` copies, so it cannot make a dangling link: no such rows there.
+SYMLINKS = os.name != "nt"
+
 # check_file fixtures, one per edge case. The odd name holds `"`, `$` and backticks.
 CHECK_FILE_SETUP = ("mkdir -p 'my dir' dots empty && touch exists.txt .hidden dots/.x '[ab]' "
-                    "'my dir/a b.txt' 'odd \"$q`x`.txt' && ln -s nowhere dangling")
+                    "'my dir/a b.txt' 'odd \"$q`x`.txt'"
+                    + (" && ln -s nowhere dangling" if SYMLINKS else ""))
 
 # What doctest run's glob.glob reports for each pattern; every bash must agree.
 CHECK_FILE_CASES = [
@@ -90,8 +98,6 @@ CHECK_FILE_CASES = [
     ("missing.txt", "fail"),         # no glob characters: comes back unchanged
     ("my dir/*.txt", "pass"),
     ('odd "$q`x`.txt', "pass"),      # data, never expanded
-    ("dangling", "pass"),            # lstat, as glob.glob
-    ("dangl*", "pass"),
     ("*hidden", "fail"),             # `*` skips dotfiles
     (".hid*", "pass"),
     ("dots/*", "fail"),
@@ -100,6 +106,8 @@ CHECK_FILE_CASES = [
     ("[ab]", "fail"),                # a glob matching nothing, though a file has its name
     ("$(touch subst)`touch tick`*", "fail"),
 ]
+if SYMLINKS:  # lstat, as glob.glob
+    CHECK_FILE_CASES += [("dangling", "pass"), ("dangl*", "pass")]
 
 CHECK_FILE_SPEC = {
     "name": "emit-smoke check_file",
@@ -109,9 +117,10 @@ CHECK_FILE_SPEC = {
     }],
 }
 
+# Resolved on PATH: on Windows a bare "bash" can start System32's WSL launcher instead.
+BASH = shutil.which("bash") or "bash"
 # Each distinct bash here: nixpkgs' has no compgen, macOS /bin/bash is 3.2.
-BASHES = sorted({os.path.realpath(b) for b in (shutil.which("bash"), "/bin/bash")
-                 if b and os.path.exists(b)})
+BASHES = sorted({os.path.realpath(b) for b in (BASH, "/bin/bash") if os.path.exists(b)})
 
 HEREDOC_SPEC = {
     "name": "emit-smoke heredoc",
@@ -160,14 +169,43 @@ KILLED_SPEC = {
     }],
 }
 
+# A step sees the options doctest run's `sh -c` has: no errexit, nounset or pipefail.
+OPTIONS_SPEC = {
+    "name": "emit-smoke step options",
+    "sections": [{
+        "title": "Steps",
+        "steps": [
+            {"run": "case $- in *e*|*u*) exit 1;; esac\nshopt -qo pipefail && exit 2\n"
+                    "false | true\necho \"[$UNSET_IN_STEP]\""},
+        ],
+    }],
+}
 
-def _emit_and_run(spec, bash="bash"):
+# Step 0.1 does not parse, so bash stops reading the script there.
+PARSE_ERROR_SPEC = {
+    "name": "emit-smoke parse error",
+    "sections": [{
+        "title": "Steps",
+        "steps": [
+            {"run": "echo first"},
+            {"run": "echo second; fi"},
+            {"run": "echo third", "check_file": "*"},
+        ],
+    }],
+}
+
+STRICT = ("-euo", "pipefail")  # how logos-windows-ci runs a generated script
+NOT_RUN = "not run: the script stopped before this command finished\n"
+
+
+def _emit_and_run(spec, bash=BASH, flags=()):
     keys = [key for key, _ in ENGINE.iter_spec_steps(spec)]
     script, _ = ENGINE.emit_smoke_script(spec, "isolation.test.yaml", "so", "linux", keys)
     work = tempfile.mkdtemp()
-    with open(os.path.join(work, "smoke.sh"), "w") as handle:
+    # LF, as emit-smoke writes it on Linux: bash reads a CR as part of the line.
+    with open(os.path.join(work, "smoke.sh"), "w", encoding="utf-8", newline="\n") as handle:
         handle.write(script)
-    proc = subprocess.run([bash, "smoke.sh"], cwd=work, capture_output=True, text=True,
+    proc = subprocess.run([bash, *flags, "smoke.sh"], cwd=work, capture_output=True, text=True,
                           env={**os.environ, "EXECS_OUT": "execs.json"})
     return work, script, proc
 
@@ -183,8 +221,15 @@ def _records(work):
     return {key: (recs[0]["status"], recs[0]["exit_code"]) for key, recs in execs.items()}
 
 
+def _all_records(work):
+    """{key: [(kind, status, exit_code)]} for every record; exit_code is None where absent."""
+    execs = json.loads(_read(work, "execs.json"))
+    return {key: [(r["kind"], r["status"], r.get("exit_code")) for r in recs]
+            for key, recs in execs.items()}
+
+
 def _bash_n(work):
-    return subprocess.run(["bash", "-n", "smoke.sh"], cwd=work, capture_output=True, text=True)
+    return subprocess.run([BASH, "-n", "smoke.sh"], cwd=work, capture_output=True, text=True)
 
 
 def _assemble(work, spec, execs_name):
@@ -228,7 +273,8 @@ class EmitSmokeIsolation(unittest.TestCase):
         self.assertNotEqual(self.proc.returncode, 0)
 
     def test_cd_does_not_carry_over(self):
-        self.assertEqual(self.read("where.txt").strip(), os.path.realpath(self.work))
+        # Under `sub` the file would be missing here. Git Bash spells pwd /c/..., hence basename.
+        self.assertEqual(os.path.basename(self.read("where.txt").strip()), os.path.basename(self.work))
 
 
 class EmitSmokeQuoting(unittest.TestCase):
@@ -269,9 +315,10 @@ class EmitSmokeCheckFile(unittest.TestCase):
     """check_file passes iff its glob matches an existing path, as in doctest run, under
     every bash here. It used `compgen -G`, which nixpkgs' bash lacks: every check failed."""
 
+    @unittest.skipIf(os.name == "nt", "doctest run does not run on Windows")
     def test_table_is_what_doctest_run_reports(self):
         work = tempfile.mkdtemp()
-        subprocess.run(["bash", "-c", CHECK_FILE_SETUP], cwd=work, check=True)
+        subprocess.run([BASH, "-c", CHECK_FILE_SETUP], cwd=work, check=True)
         results = ENGINE.Results(fail_fast=False)
         native = []
         with contextlib.redirect_stdout(io.StringIO()):
@@ -358,12 +405,64 @@ class EmitSmokeRecords(unittest.TestCase):
         self.assertIn("(2 record(s), 1 passed, 1 failed)", proc.stdout)
         self.assertEqual(steps, [["fail", "pass"]])
 
-    def test_killed_mid_step_keeps_the_records_written(self):
-        work, _, proc = _emit_and_run(KILLED_SPEC)
-        self.assertNotEqual(proc.returncode, 0)
-        execs = json.loads(_read(work, "execs.json"))
-        self.assertEqual({key: [r["output"] for r in recs] for key, recs in execs.items()},
-                         {"0.0": ["kept\n"]})
+
+class EmitSmokeStrictInvocation(unittest.TestCase):
+    """logos-windows-ci runs the script as `bash -euo pipefail`, and that must change no
+    record. Its errexit used to end the script at the first failing step, unrecorded."""
+
+    def test_records_match_plain_bash(self):
+        specs = {"isolation": SPEC, "quoting": QUOTING_SPEC, "heredoc": HEREDOC_SPEC,
+                 "records": RECORDS_SPEC, "check_file": CHECK_FILE_SPEC, "options": OPTIONS_SPEC}
+        for bash in BASHES:
+            for name, spec in specs.items():
+                with self.subTest(bash=bash, spec=name):
+                    plain, _, plain_proc = _emit_and_run(spec, bash)
+                    strict, _, strict_proc = _emit_and_run(spec, bash, STRICT)
+                    self.assertEqual(_all_records(strict), _all_records(plain), strict_proc.stdout)
+                    self.assertEqual(strict_proc.returncode, plain_proc.returncode)
+
+    def test_steps_run_without_the_scripts_options(self):
+        for bash in BASHES:
+            for flags in ((), STRICT):
+                with self.subTest(bash=bash, flags=flags):
+                    work, _, proc = _emit_and_run(OPTIONS_SPEC, bash, flags)
+                    self.assertEqual(_all_records(work), {"0.0": [("run", "pass", 0)]}, proc.stdout)
+
+
+class EmitSmokeStoppedEarly(unittest.TestCase):
+    """A script that stops early (a signal, a parse error) records each command it did not
+    finish as failed, so its records cannot read as a pass. A hard kill leaves invalid JSON."""
+
+    def test_killed_mid_step(self):
+        for bash in BASHES:
+            with self.subTest(bash=bash):
+                work, _, proc = _emit_and_run(KILLED_SPEC, bash)
+                self.assertNotEqual(proc.returncode, 0)
+                pairs = json.loads(_read(work, "execs.json"), object_pairs_hook=lambda p: p)
+                self.assertEqual([key for key, _ in pairs], ["0.0", "0.1"])
+                execs = json.loads(_read(work, "execs.json"))
+                self.assertEqual({key: [(r["status"], r["output"]) for r in recs]
+                                  for key, recs in execs.items()},
+                                 {"0.0": [("pass", "kept\n"), ("fail", NOT_RUN)],
+                                  "0.1": [("fail", NOT_RUN)]})
+
+    def test_parse_error(self):
+        for bash in BASHES:
+            with self.subTest(bash=bash):
+                work, _, proc = _emit_and_run(PARSE_ERROR_SPEC, bash)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertEqual(_all_records(work), {
+                    "0.0": [("run", "pass", 0)],
+                    "0.1": [("run", "fail", None)],
+                    "0.2": [("run", "fail", None), ("check_file", "fail", None)],
+                })
+
+    def test_assemble_counts_them_as_failed(self):
+        work, _, _ = _emit_and_run(KILLED_SPEC)
+        proc, steps = _assemble(work, KILLED_SPEC, "execs.json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("(3 record(s), 1 passed, 2 failed)", proc.stdout)
+        self.assertEqual(steps, [["pass", "fail"], ["fail"]])
 
 
 if __name__ == "__main__":

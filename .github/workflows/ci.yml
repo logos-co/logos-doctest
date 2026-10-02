@@ -129,6 +129,37 @@ jobs:
           path: ${{ runner.temp }}/reports/
           if-no-files-found: warn
 
+  # Generated scripts run on Windows, in Git for Windows bash, which logos-windows-ci
+  # starts as `bash -euo pipefail`. Nix does not run there, so this job uses pip.
+  windows:
+    name: Self-test emit-smoke (windows-latest, Git Bash)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install PyYAML
+        run: python -m pip install pyyaml
+
+      # The tests run `bash` from PATH; the scripts write their records with `python3`.
+      - name: Show the bash and python3 the scripts get
+        run: |
+          python -c 'import shutil; print("bash:", shutil.which("bash"))'
+          bash --version | head -1
+          command -v python3 && python3 --version
+
+      - name: Unit-test emit-smoke under Git Bash
+        run: python tests/test_emit_smoke.py
+
   publish-report:
     name: Publish reports to GitHub Pages
     needs: test
