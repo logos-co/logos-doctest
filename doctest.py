@@ -1472,13 +1472,20 @@ def _ui_action_md_blocks(ui_test_spec, images_dir=None):
     return blocks
 
 
+# Actions that act on the UI, as opposed to waiting for or asserting on it.
+UI_CHANGING = {"click", "click_object", "set_text", "set_property", "call_method"}
+
+
 def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=None,
                        trace_path=None):
     """Generate a .mjs test file from YAML test actions for logos-qt-mcp.
 
     If an action carries a `screenshot:` field (a filename), the generated test
     captures the headless app via `app.screenshot()` right after that action and
-    writes the decoded PNG into `images_dir`.
+    writes the decoded PNG into `images_dir`. When the UI was acted on since the
+    previous capture in this ui_test (`UI_CHANGING` actions), an identical capture
+    is re-taken for up to a second, then fails the action unless it sets
+    `allow_unchanged_screenshot: true`.
     """
     import json as _json
 
@@ -1492,6 +1499,7 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
         f.write('import { resolve } from "node:path";\n')
         f.write('import { writeFileSync } from "node:fs";\n')
         f.write('import { pathToFileURL } from "node:url";\n')
+        f.write('import { createHash } from "node:crypto";\n')
         f.write(f'const qtMcpRoot = {_json.dumps(qt_mcp_path)};\n')
         # A URL: Node on Windows reads an absolute `C:\...` specifier as a `c:` scheme.
         f.write('const { test, run } = await import('
@@ -1514,6 +1522,30 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
         f.write('    entry.duration_ms = Date.now() - started; saveActions();\n')
         f.write('  }\n')
         f.write('}\n\n')
+        # After an action on the UI, a capture identical to the previous one is
+        # usually a frame not repainted yet: re-take it for a second, then fail.
+        f.write('let previousShot = null;\n')
+        f.write('let actedSinceShot = false;\n')
+        f.write('async function screenshot(app, file, dest, allowUnchanged) {\n')
+        f.write('  const compare = previousShot && actedSinceShot && !allowUnchanged;\n')
+        f.write('  const deadline = Date.now() + 1000;\n')
+        f.write('  let shot, hash, retakes = 0;\n')
+        f.write('  for (;;) {\n')
+        f.write('    shot = await app.screenshot();\n')
+        f.write('    if (!shot || !shot.image) throw new Error("screenshot " + file + ": no image returned");\n')
+        f.write('    hash = createHash("sha256").update(shot.image).digest("hex");\n')
+        f.write('    if (!compare || hash !== previousShot.hash || Date.now() >= deadline) break;\n')
+        f.write('    retakes++;\n')
+        f.write('    await new Promise((r) => setTimeout(r, 100));\n')
+        f.write('  }\n')
+        f.write('  if (compare && hash === previousShot.hash)\n')
+        f.write('    throw new Error("screenshot " + file + ": identical to " + previousShot.file +\n')
+        f.write('      " although the UI was acted on since; set allow_unchanged_screenshot: true if that is intended");\n')
+        f.write('  if (retakes) console.log("screenshot " + file + ": matched " + previousShot.file + ", re-took it " + retakes + "x");\n')
+        f.write('  writeFileSync(dest, Buffer.from(shot.image, "base64"));\n')
+        f.write('  previousShot = { file, hash };\n')
+        f.write('  actedSinceShot = false;\n')
+        f.write('}\n\n')
         f.write(f'test({_json.dumps(test_name)}, async (app) => {{\n')
 
         def emit_screenshot(t):
@@ -1521,15 +1553,8 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
             if not fname or not images_dir:
                 return
             dest = _json.dumps(os.path.join(images_dir, fname))
-            label = _json.dumps(fname)
-            f.write(f'  {{\n')
-            f.write(f'    const shot = await app.screenshot();\n')
-            f.write(f'    if (shot && shot.image) {{\n')
-            f.write(f'      writeFileSync({dest}, Buffer.from(shot.image, "base64"));\n')
-            f.write(f'    }} else {{\n')
-            f.write(f'      throw new Error("screenshot " + {label} + ": no image returned");\n')
-            f.write(f'    }}\n')
-            f.write(f'  }}\n')
+            allow = "true" if t.get("allow_unchanged_screenshot") else "false"
+            f.write(f'  await screenshot(app, {_json.dumps(fname)}, {dest}, {allow});\n')
 
         for i, t in enumerate(tests):
             f.write(f'  await uiAction({i}, async () => {{\n')
@@ -1631,6 +1656,8 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 ms = t.get("ms", 1000)
                 f.write(f'  await new Promise(r => setTimeout(r, {ms}));\n')
 
+            if action in UI_CHANGING:
+                f.write('  actedSinceShot = true;\n')
             emit_screenshot(t)
             f.write('  });\n')
 

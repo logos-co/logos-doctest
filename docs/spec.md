@@ -232,6 +232,16 @@ section as `![<name>](images/<file>.png)`, so screenshots appear in the
 published tutorial with no extra markup. The `.png` extension is added if
 omitted; the value is reduced to a basename.
 
+Within one `ui_test`, if a `click`, `click_object`, `set_text`, `set_property`
+or `call_method` ran since the previous screenshot, a byte-identical screenshot
+is treated as a stale capture: an app can repaint a frame after its object tree,
+which `wait_for` reads, already changed. The runner re-takes it every 100 ms for
+up to a second and logs `re-took it Nx` when that helps. If it is still
+identical, the action fails. Set `allow_unchanged_screenshot: true` on an action
+whose screenshot is meant to look like the previous one. Screenshots separated
+only by `wait_for`, `expect_texts`, `expect_property` or `sleep` are not
+compared.
+
 Any action may also carry an optional **`text`** field: prose (full markdown,
 supports `{var}` expansion) rendered in the generated tutorial and the HTML
 report at that point in the action sequence. When the same action also has a
