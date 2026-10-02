@@ -53,8 +53,9 @@ jobs:
         run: nix develop .# --command python3 tests/test_inject_double_dash.py
 
       # A generated Windows script ran a multi-line step twice (its header
-      # comment covered one line) and a step's `set -e` killed the rest.
-      - name: Unit-test emit-smoke step isolation
+      # comment covered one line) and a step's `set -e` killed the rest. A
+      # step's passing last record also hid its earlier failure from `assemble`.
+      - name: Unit-test emit-smoke step isolation and records
         run: nix develop .# --command python3 tests/test_emit_smoke.py
 
       - name: Setup Node for UI execution regression tests

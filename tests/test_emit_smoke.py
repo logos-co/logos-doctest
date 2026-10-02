@@ -14,6 +14,9 @@ Bugs these guard against, found running real specs on Windows:
   expanded.
 - Command lines were indented, so a heredoc's `EOF` never matched (another
   parse error) and every multi-line string gained two spaces per line.
+- A step with several records (file/run/extra_run/check_file) wrote its key once
+  per record. json.load keeps the last, so a failing `run:` before a passing
+  `extra_run:` assembled as a pass.
 
 doctest runs every step in its own shell, so a generated script must too.
 
@@ -24,8 +27,11 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
+
+import yaml
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -86,6 +92,38 @@ cat config.json""", "expect_contains": ['"home": "$HOME"']},
     }],
 }
 
+# Steps with several records, where a failure is followed by a pass. The file
+# write fails because `dir` is a directory; check_file matches nothing.
+RECORDS_SPEC = {
+    "name": "emit-smoke records",
+    "sections": [{
+        "title": "Steps",
+        "steps": [
+            {"run": "echo main; mkdir dir; exit 3", "extra_run": {"run": "echo verify"}},
+            {"file": {"path": "dir", "content": "x"}, "run": "echo ok",
+             "check_file": "missing-*"},
+            {"run": "echo alone"},
+        ],
+    }],
+}
+
+# Step 0.0 above as scripts from before the fix recorded it: the key twice.
+REPEATED_KEY_EXECS = (
+    '{"0.0":[{"kind": "run", "cmd": "echo main; mkdir dir; exit 3", "status": "fail", '
+    '"exit_code": 3, "output": "main\\n"}],"0.0":[{"kind": "run", "cmd": "echo verify", '
+    '"status": "pass", "exit_code": 0, "output": "verify\\n"}]}')
+
+KILLED_SPEC = {
+    "name": "emit-smoke killed mid-step",
+    "sections": [{
+        "title": "Steps",
+        "steps": [
+            {"run": "echo kept", "extra_run": {"run": "kill -TERM $$"}},
+            {"run": "echo never"},
+        ],
+    }],
+}
+
 
 def _emit_and_run(spec):
     keys = [key for key, _ in ENGINE.iter_spec_steps(spec)]
@@ -111,6 +149,20 @@ def _records(work):
 
 def _bash_n(work):
     return subprocess.run(["bash", "-n", "smoke.sh"], cwd=work, capture_output=True, text=True)
+
+
+def _assemble(work, spec, execs_name):
+    """`doctest assemble` on a records file: (process, per-step statuses in the payload)."""
+    with open(os.path.join(work, "spec.test.yaml"), "w") as handle:
+        yaml.safe_dump(spec, handle)
+    proc = subprocess.run([sys.executable, os.path.join(ROOT, "doctest.py"), "assemble",
+                           "spec.test.yaml", execs_name, "-o", "results.json"],
+                          cwd=work, capture_output=True, text=True)
+    if proc.returncode:
+        return proc, None
+    payload = json.loads(_read(work, "results.json"))
+    rows = [row for tutorial in payload["tutorials"] for row in tutorial["rows"]]
+    return proc, [[rec["status"] for rec in row["execs"]] for row in rows if row.get("execs")]
 
 
 class EmitSmokeIsolation(unittest.TestCase):
@@ -199,6 +251,50 @@ class EmitSmokeVerbatimCommand(unittest.TestCase):
 
     def test_multiline_string_keeps_its_lines(self):
         self.assertEqual(_read(self.work, "multiline.txt"), "first\nsecond\n")
+
+
+class EmitSmokeRecords(unittest.TestCase):
+    """Every record of a step reaches the reader, failures included."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.work, cls.script, cls.proc = _emit_and_run(RECORDS_SPEC)
+
+    def test_each_step_key_is_written_once(self):
+        pairs = json.loads(_read(self.work, "execs.json"), object_pairs_hook=lambda p: p)
+        self.assertEqual([key for key, _ in pairs], ["0.0", "0.1", "0.2"])
+
+    def test_plain_json_load_keeps_every_record(self):
+        execs = json.loads(_read(self.work, "execs.json"))
+        self.assertEqual({key: [(r["kind"], r["status"]) for r in recs]
+                          for key, recs in execs.items()}, {
+            "0.0": [("run", "fail"), ("run", "pass")],
+            "0.1": [("file", "fail"), ("run", "pass"), ("check_file", "fail")],
+            "0.2": [("run", "pass")],
+        })
+        self.assertNotEqual(self.proc.returncode, 0)
+
+    def test_assemble_reports_the_failures(self):
+        proc, steps = _assemble(self.work, RECORDS_SPEC, "execs.json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("(6 record(s), 3 passed, 3 failed)", proc.stdout)
+        self.assertEqual(steps, [["fail", "pass"], ["fail", "pass", "fail"], ["pass"]])
+
+    def test_assemble_keeps_repeated_keys_from_older_scripts(self):
+        work = tempfile.mkdtemp()
+        with open(os.path.join(work, "old-execs.json"), "w") as handle:
+            handle.write(REPEATED_KEY_EXECS)
+        proc, steps = _assemble(work, RECORDS_SPEC, "old-execs.json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("(2 record(s), 1 passed, 1 failed)", proc.stdout)
+        self.assertEqual(steps, [["fail", "pass"]])
+
+    def test_killed_mid_step_keeps_the_records_written(self):
+        work, _, proc = _emit_and_run(KILLED_SPEC)
+        self.assertNotEqual(proc.returncode, 0)
+        execs = json.loads(_read(work, "execs.json"))
+        self.assertEqual({key: [r["output"] for r in recs] for key, recs in execs.items()},
+                         {"0.0": ["kept\n"]})
 
 
 if __name__ == "__main__":

@@ -223,6 +223,16 @@ def iter_spec_steps(spec):
             yield step_key(si, ti), step
 
 
+def merge_repeated_keys(pairs):
+    """json object_pairs_hook: older emit-smoke scripts repeat a step's key, once per record."""
+    merged = {}
+    for key, value in pairs:
+        if isinstance(merged.get(key), list) and isinstance(value, list):
+            value = merged[key] + value
+        merged[key] = value
+    return merged
+
+
 def collector_from_execs(spec, spec_path, meta, execs_by_key, workdir=None):
     """Build a ReportCollector whose records came from somewhere else.
 
@@ -3641,30 +3651,32 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
     w("set -uo pipefail")
     w("")
     w('EXECS_OUT="${EXECS_OUT:-execs.json}"')
-    w('_n=0')
+    w('_key=')
     w('printf "{" > "$EXECS_OUT"')
     w("")
     w("# One record per command, in the shape doctest's own collector produces:")
     w("# kind/cmd/status/exit_code/output. Written incrementally so a script that")
     w("# dies mid-way still yields the records for the steps that did run.")
+    w("# A step's records share one key, written once: json.load keeps only the last.")
     w("_rec() {  # $1 key  $2 cmd  $3 status  $4 rc  $5 output-file  $6 kind")
-    w('  local key=$1 cmd=$2 status=$3 rc=$4 outf=$5 kind=${6:-run}')
-    w('  [ "$_n" -eq 0 ] || printf "," >> "$EXECS_OUT"')
-    w('  _n=$((_n+1))')
-    w('  python3 - "$key" "$cmd" "$status" "$rc" "$outf" "$kind" >> "$EXECS_OUT" <<\'PYREC\'')
+    w('  local key=$1 cmd=$2 status=$3 rc=$4 outf=$5 kind=${6:-run} new=1')
+    w('  if [ "$key" = "$_key" ]; then printf "," >> "$EXECS_OUT"; new=0')
+    w('  elif [ -n "$_key" ]; then printf "]," >> "$EXECS_OUT"; fi')
+    w('  _key=$key')
+    w('  python3 - "$key" "$cmd" "$status" "$rc" "$outf" "$kind" "$new" >> "$EXECS_OUT" <<\'PYREC\'')
     w("import json, sys")
-    w("key, cmd, status, rc, outf, kind = sys.argv[1:7]")
+    w("key, cmd, status, rc, outf, kind, new = sys.argv[1:8]")
     w("try:")
     w("    output = open(outf, errors='replace').read()")
     w("except Exception:")
     w("    output = ''")
-    w("sys.stdout.write(json.dumps(key) + ':' + json.dumps(")
-    w("    [{'kind': kind, 'cmd': cmd, 'status': status,")
-    w("      'exit_code': int(rc), 'output': output}]))")
+    w("rec = json.dumps({'kind': kind, 'cmd': cmd, 'status': status,")
+    w("                  'exit_code': int(rc), 'output': output})")
+    w("sys.stdout.write((json.dumps(key) + ':[' if new == '1' else '') + rec)")
     w("PYREC")
     w("}")
     w("")
-    w("_fin() { printf '}' >> \"$EXECS_OUT\"; }")
+    w("_fin() { [ -z \"$_key\" ] || printf ']' >> \"$EXECS_OUT\"; printf '}' >> \"$EXECS_OUT\"; }")
     w("trap _fin EXIT")
     w("")
     w("rc_all=0")
@@ -3909,7 +3921,7 @@ def cmd_assemble(args):
     spec, spec_path = load_spec_for_emit(args.spec)
     try:
         with open(args.execs_json) as f:
-            execs = _json.load(f)
+            execs = _json.load(f, object_pairs_hook=merge_repeated_keys)
     except Exception as e:
         print(f"ERROR: could not read {args.execs_json}: {e}", file=sys.stderr)
         sys.exit(2)
