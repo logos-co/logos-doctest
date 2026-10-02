@@ -3648,10 +3648,12 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
     w("#     doctest report leg-a.json leg-b.json -o index.html")
     w("# which is a COMPLETE report -- build steps and run steps, each recorded")
     w("# where it actually executed.")
-    w("set -uo pipefail")
+    w("# Not -e, even when run as `bash -e`: a failing step is recorded and the next one runs.")
+    w("set +e -uo pipefail")
     w("")
     w('EXECS_OUT="${EXECS_OUT:-execs.json}"')
     w('_key=')
+    todo_at = len(out)  # `_todo` goes here once every command is known
     w('printf "{" > "$EXECS_OUT"')
     w("")
     w("# One record per command, in the shape doctest's own collector produces:")
@@ -3662,7 +3664,7 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
     w('  local key=$1 cmd=$2 status=$3 rc=$4 outf=$5 kind=${6:-run} new=1')
     w('  if [ "$key" = "$_key" ]; then printf "," >> "$EXECS_OUT"; new=0')
     w('  elif [ -n "$_key" ]; then printf "]," >> "$EXECS_OUT"; fi')
-    w('  _key=$key')
+    w('  _key=$key; _todo=${_todo#* }')
     w('  python3 - "$key" "$cmd" "$status" "$rc" "$outf" "$kind" "$new" >> "$EXECS_OUT" <<\'PYREC\'')
     w("import json, sys")
     w("key, cmd, status, rc, outf, kind, new = sys.argv[1:8]")
@@ -3670,13 +3672,25 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
     w("    output = open(outf, errors='replace').read()")
     w("except Exception:")
     w("    output = ''")
-    w("rec = json.dumps({'kind': kind, 'cmd': cmd, 'status': status,")
-    w("                  'exit_code': int(rc), 'output': output})")
-    w("sys.stdout.write((json.dumps(key) + ':[' if new == '1' else '') + rec)")
+    w("rec = {'kind': kind, 'cmd': cmd, 'status': status}")
+    w("if rc:")
+    w("    rec['exit_code'] = int(rc)")
+    w("rec['output'] = output")
+    w("sys.stdout.write((json.dumps(key) + ':[' if new == '1' else '') + json.dumps(rec))")
     w("PYREC")
     w("}")
     w("")
-    w("_fin() { [ -z \"$_key\" ] || printf ']' >> \"$EXECS_OUT\"; printf '}' >> \"$EXECS_OUT\"; }")
+    w("# Records every command that never finished as failed, then closes the JSON: a script")
+    w("# that stopped early (a signal, a parse error) must not pass on the records it left.")
+    w("_fin() {")
+    w("  local item o")
+    w('  if [ -n "$_todo" ]; then')
+    w('    o=$(mktemp); echo "not run: the script stopped before this command finished" > "$o"')
+    w('    for item in $_todo; do _rec "${item%%:*}" "" fail "" "$o" "${item#*:}"; done')
+    w('    rm -f "$o"')
+    w("  fi")
+    w("  [ -z \"$_key\" ] || printf ']' >> \"$EXECS_OUT\"; printf '}' >> \"$EXECS_OUT\"")
+    w("}")
     w("trap _fin EXIT")
     w("")
     # Not `compgen -G`: nixpkgs' bash is built without it.
@@ -3693,6 +3707,14 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
         w(")")
         w("")
     w("rc_all=0")
+
+    todo = []
+
+    def rec(key, cmd, kind):
+        """The `_rec` line that closes one command, which `_fin` fails if it never runs."""
+        todo.append(f"{key}:{kind}")
+        w(f'_rec {shlex.quote(key)} {shlex.quote(cmd)} '
+          f'"$([ "$_rc" -eq 0 ] && echo pass || echo fail)" "$_rc" "$_o" {kind}')
 
     for key in keys:
         step = steps[key]
@@ -3720,8 +3742,7 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
                 w("DOCTEST_FILE_EOF")
             w('_rc=$?')
             w(f'_o=$(mktemp); printf "wrote %s\\n" {shlex.quote(path)} > "$_o"')
-            w(f'_rec {shlex.quote(key)} {shlex.quote("write " + path)} '
-              f'"$([ "$_rc" -eq 0 ] && echo pass || echo fail)" "$_rc" "$_o" file')
+            rec(key, "write " + path, "file")
             w('rm -f "$_o"')
             w('[ "$_rc" -eq 0 ] || rc_all=$_rc')
 
@@ -3756,6 +3777,8 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
             # A subshell, as doctest runs each step in its own shell: a step's
             # `set -e`, `cd` or `exit` must not reach the steps after it.
             w("(")
+            # doctest's shell is `sh -c`, so none of this script's options apply inside.
+            w("set +euo pipefail")
             # Unindented: an indent breaks heredoc terminators and multi-line strings.
             w(cmd.rstrip("\n"))
             w(') >"$_o" 2>&1; _rc=$?')
@@ -3768,8 +3791,7 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
                     msg = shlex.quote("::error::expected output not found: " + want)
                     w(f'  grep -qF -- {shlex.quote(want)} "$_o" || {{ echo {msg}; _rc=90; }}')
                 w("fi")
-            w(f'_rec {shlex.quote(key)} {shlex.quote(cmd)} '
-              f'"$([ "$_rc" -eq 0 ] && echo pass || echo fail)" "$_rc" "$_o" run')
+            rec(key, cmd, "run")
             w('rm -f "$_o"')
             w('[ "$_rc" -eq 0 ] || rc_all=$_rc')
 
@@ -3783,13 +3805,15 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
             w(f'if _glob {shlex.quote(pattern)} > "$_o"; then _rc=0; else '
               f'_rc=1; echo {shlex.quote("no match: " + pattern)} > "$_o"; fi')
             w('cat "$_o"')
-            w(f'_rec {shlex.quote(key)} {shlex.quote("check file: " + pattern)} '
-              f'"$([ "$_rc" -eq 0 ] && echo pass || echo fail)" "$_rc" "$_o" check_file')
+            rec(key, "check file: " + pattern, "check_file")
             w('rm -f "$_o"')
             w('[ "$_rc" -eq 0 ] || rc_all=$_rc')
 
     w("")
     w('exit "$rc_all"')
+    out[todo_at:todo_at] = [
+        "# Every command's record, in run order: _rec drops each one it writes, _fin fails the rest.",
+        "_todo=" + shlex.quote("".join(f"{item} " for item in todo))]
     return "\n".join(out) + "\n", warnings
 
 
