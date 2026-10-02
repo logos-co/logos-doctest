@@ -107,6 +107,10 @@ sections:
       `--ext` and `--exe` resolve `{ext}` and `{exe}` for the target, so one spec
       serves every platform: `{exe}` is empty on Unix and `.exe` for Windows.
 
+      The script cannot run a `ui_test` yet. One selected for the target is
+      recorded as **failed** rather than left out, so a leg never passes a UI
+      test it did not run: mark it for the platforms that can run it.
+
       > The inner spec above writes `{{ext}}`, doubled. A placeholder is expanded
       > by whichever run *reads* it, so an unescaped `{ext}` in a `file:` step
       > would be resolved by this outer tutorial — on the machine you are reading

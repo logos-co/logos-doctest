@@ -20,6 +20,8 @@ Bugs these guard against, found running real specs on Windows:
 - logos-windows-ci runs the script as `bash -euo pipefail`. Its errexit ended the
   script at the first failing step, before that step's record, so the records
   left behind all passed.
+- A selected `ui_test` step produced no line and no record, so the leg passed a
+  UI test that never ran.
 
 doctest runs every step in its own shell, so a generated script must too.
 
@@ -190,6 +192,24 @@ PARSE_ERROR_SPEC = {
             {"run": "echo first"},
             {"run": "echo second; fi"},
             {"run": "echo third", "check_file": "*"},
+        ],
+    }],
+}
+
+# Step 0.1 is a UI test the script cannot run. Step 0.3 has `run:`, so doctest run runs
+# that and never reaches its ui_test.
+UI_TEST_SPEC = {
+    "name": "emit-smoke ui_test",
+    "sections": [{
+        "title": "Steps",
+        "steps": [
+            {"run": "echo before"},
+            {"title": "Drive the app", "ui_test": {
+                "launch": "./app/bin/app{exe} --user-dir ./data",
+                "tests": [{"action": "wait_for", "texts": ["Ready"]}]}},
+            {"run": "echo after"},
+            {"run": "echo run wins", "ui_test": {
+                "launch": "./app/bin/app{exe}", "tests": [{"action": "sleep", "ms": 1}]}},
         ],
     }],
 }
@@ -412,7 +432,8 @@ class EmitSmokeStrictInvocation(unittest.TestCase):
 
     def test_records_match_plain_bash(self):
         specs = {"isolation": SPEC, "quoting": QUOTING_SPEC, "heredoc": HEREDOC_SPEC,
-                 "records": RECORDS_SPEC, "check_file": CHECK_FILE_SPEC, "options": OPTIONS_SPEC}
+                 "records": RECORDS_SPEC, "check_file": CHECK_FILE_SPEC, "options": OPTIONS_SPEC,
+                 "ui_test": UI_TEST_SPEC}
         for bash in BASHES:
             for name, spec in specs.items():
                 with self.subTest(bash=bash, spec=name):
@@ -463,6 +484,52 @@ class EmitSmokeStoppedEarly(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("(3 record(s), 1 passed, 2 failed)", proc.stdout)
         self.assertEqual(steps, [["pass", "fail"], ["fail"]])
+
+
+class EmitSmokeUiTest(unittest.TestCase):
+    """A script cannot run a ui_test yet, so it records the step as failed instead of
+    leaving it out, and the steps around it still run."""
+
+    def test_recorded_as_failed(self):
+        for bash in BASHES:
+            for flags in ((), STRICT):
+                with self.subTest(bash=bash, flags=flags):
+                    work, _, proc = _emit_and_run(UI_TEST_SPEC, bash, flags)
+                    self.assertEqual(_all_records(work), {
+                        "0.0": [("run", "pass", 0)],
+                        "0.1": [("ui_test", "fail", None)],
+                        "0.2": [("run", "pass", 0)],
+                        "0.3": [("run", "pass", 0)],
+                    }, proc.stdout)
+                    self.assertEqual(proc.returncode, 1)
+                    record = json.loads(_read(work, "execs.json"))["0.1"][0]
+                    self.assertEqual(record["cmd"], "./app/bin/app --user-dir ./data")
+                    self.assertTrue(record["output"].startswith("not run: "), record["output"])
+                    self.assertIn("::error::0.1 Drive the app: not run: ", proc.stdout)
+
+    def test_warns_for_that_step_only(self):
+        keys = [key for key, _ in ENGINE.iter_spec_steps(UI_TEST_SPEC)]
+        _, warnings = ENGINE.emit_smoke_script(UI_TEST_SPEC, "ui.test.yaml", "dll", "windows",
+                                               keys, ".exe")
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("step 0.1 ('Drive the app') is a ui_test", warnings[0])
+
+    def test_strict_refuses_to_emit(self):
+        work = tempfile.mkdtemp()
+        with open(os.path.join(work, "ui.test.yaml"), "w") as handle:
+            yaml.safe_dump(UI_TEST_SPEC, handle)
+        proc = subprocess.run([sys.executable, os.path.join(ROOT, "doctest.py"), "emit-smoke",
+                               "ui.test.yaml", "--platform", "windows", "--strict", "-o", "s.sh"],
+                              cwd=work, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("is a ui_test", proc.stderr)
+
+    def test_assemble_counts_it_as_failed(self):
+        work, _, _ = _emit_and_run(UI_TEST_SPEC)
+        proc, steps = _assemble(work, UI_TEST_SPEC, "execs.json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("(4 record(s), 3 passed, 1 failed)", proc.stdout)
+        self.assertEqual(steps, [["pass"], ["fail"], ["pass"], ["pass"]])
 
 
 if __name__ == "__main__":
