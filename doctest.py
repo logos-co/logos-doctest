@@ -3630,7 +3630,8 @@ def _header(text):
 
 
 def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
-    """Bash that runs `keys` and writes a positional exec-record JSON."""
+    """Bash that runs `keys` and writes a positional exec-record JSON.
+    A ui_test it cannot run is recorded as failed."""
     steps = dict(iter_spec_steps(spec))
     warnings = []
     out = []
@@ -3710,11 +3711,11 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
 
     todo = []
 
-    def rec(key, cmd, kind):
-        """The `_rec` line that closes one command, which `_fin` fails if it never runs."""
+    def rec(key, cmd, kind, status='"$([ "$_rc" -eq 0 ] && echo pass || echo fail)" "$_rc"'):
+        """The `_rec` line that closes one command, which `_fin` fails if it never runs.
+        `status` is _rec's status and exit-code arguments; by default both come from $_rc."""
         todo.append(f"{key}:{kind}")
-        w(f'_rec {shlex.quote(key)} {shlex.quote(cmd)} '
-          f'"$([ "$_rc" -eq 0 ] && echo pass || echo fail)" "$_rc" "$_o" {kind}')
+        w(f'_rec {shlex.quote(key)} {shlex.quote(cmd)} {status} "$_o" {kind}')
 
     for key in keys:
         step = steps[key]
@@ -3794,6 +3795,26 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
             rec(key, cmd, "run")
             w('rm -f "$_o"')
             w('[ "$_rc" -eq 0 ] || rc_all=$_rc')
+
+        # A ui_test this script cannot run is a failure, not a gap: dropping it let a leg
+        # pass a UI test that never ran. doctest run reaches one only without file/run.
+        ui = step.get("ui_test") or {}
+        if ui.get("tests") and not step.get("file") and not step.get("run"):
+            cmd = (ui.get("launch") or ui.get("binary") or "").replace("{ext}", ext).replace("{exe}", exe)
+            msg = (f"not run: a generated script cannot run a ui_test yet. If it is not meant "
+                   f"to run on {platform_label}, mark the step or its section with the "
+                   f"platforms it runs on.")
+            warnings.append(
+                f"step {key} ({title!r}) is a ui_test, which a generated script cannot "
+                f"run yet: the script records it as failed on {platform_label}.")
+            label = _header(title or "ui_test")
+            w("")
+            w(f"# --- {key}  {label}  (ui_test: not run)")
+            w(f'_o=$(mktemp); printf "%s\\n" {shlex.quote(msg)} > "$_o"')
+            w(f"echo {shlex.quote(f'::error::{key} {label}: {msg}')}")
+            rec(key, cmd, "ui_test", status="fail ''")
+            w('rm -f "$_o"')
+            w("rc_all=1")
 
         # `check_file:` asserts a glob matched something.
         pattern = step.get("check_file", "")
