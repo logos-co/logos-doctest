@@ -1491,8 +1491,11 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
     with open(output_path, "w") as f:
         f.write('import { resolve } from "node:path";\n')
         f.write('import { writeFileSync } from "node:fs";\n')
+        f.write('import { pathToFileURL } from "node:url";\n')
         f.write(f'const qtMcpRoot = {_json.dumps(qt_mcp_path)};\n')
-        f.write('const { test, run } = await import(resolve(qtMcpRoot, "test-framework/framework.mjs"));\n\n')
+        # A URL: Node on Windows reads an absolute `C:\...` specifier as a `c:` scheme.
+        f.write('const { test, run } = await import('
+                'pathToFileURL(resolve(qtMcpRoot, "test-framework/framework.mjs")).href);\n\n')
         f.write(f'const tracePath = {_json.dumps(trace_path)};\n')
         f.write('const actions = [];\n')
         f.write('const saveActions = () => writeFileSync(tracePath, JSON.stringify(actions));\n')
@@ -3568,7 +3571,9 @@ _NIX_RE = re.compile(r"\bnix\s+(build|run|develop|shell|flake|profile|copy)\b")
 def _step_is_nix(step):
     cmd = step.get("run", "") or ""
     extra = (step.get("extra_run", {}) or {}).get("run", "") or ""
-    return bool(_NIX_RE.search(cmd) or _NIX_RE.search(extra))
+    ui = step.get("ui_test") or {}
+    ui_cmds = [ui.get("launch", "") or "", *(ui.get("setup", []) or [])]
+    return any(_NIX_RE.search(str(c)) for c in (cmd, extra, *ui_cmds))
 
 
 def _platforms_of(obj):
@@ -3629,9 +3634,347 @@ def _header(text):
     return lines[0] + (" …" if len(lines) > 1 else "")
 
 
+def _ui_test_of(step):
+    """The ui_test doctest run would execute for `step`, else None: it dispatches file:,
+    then run:, then ui_test:, and a ui_test with no tests does nothing."""
+    ui = step.get("ui_test") or {}
+    if ui.get("tests") and not step.get("file") and not step.get("run"):
+        return ui
+    return None
+
+
+def _ui_test_plan(spec, step, ui, ext, exe):
+    """(driver source or None, runner config) for one ui_test of a generated script.
+    A non-empty `refuse` says why the script cannot run it; the runner records that."""
+    def sub(cmd):
+        return (cmd or "").replace("{ext}", ext).replace("{exe}", exe)
+
+    tests = ui.get("tests") or []
+    cfg = {
+        "cmd": sub(ui.get("launch") or ui.get("binary")),
+        "launch": sub(ui.get("launch")),
+        "setup": [sub(c) for c in ui.get("setup", []) or []],
+        "qt_mcp": ui.get("qt_mcp", "") or "",
+        "port": int(ui.get("inspector_port", 3768)),
+        "launch_timeout": ui.get("launch_timeout", 120),
+        "descriptions": [_describe_ui_actions([t])[2:] for t in tests],
+        "images": "images",
+        "refuse": "",
+    }
+    driver = None
+    if not cfg["launch"]:
+        cfg["refuse"] = ("a generated script starts the app with the ui_test's launch: "
+                         "command, and this one has none")
+    elif not cfg["qt_mcp"]:
+        cfg["refuse"] = ("a generated script needs the ui_test's qt_mcp: path, the "
+                         "logos-qt-mcp directory staged with the app")
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ui-test.mjs")
+            try:
+                generate_mjs_tests(
+                    tests, cfg["qt_mcp"],
+                    f"{spec.get('name', 'tutorial')}: {step.get('title', 'UI tests')}",
+                    path, images_dir=cfg["images"], trace_path="ui-test.actions.json")
+                with open(path) as f:
+                    driver = f.read()
+            except ValueError as exc:
+                cfg["refuse"] = str(exc)
+    if cfg["refuse"]:
+        cfg["refuse"] = "not run: " + cfg["refuse"]
+    return driver, cfg
+
+
+# Appends the record ui-test-run.py wrote, with _rec's bookkeeping.
+_RECJSON = r"""
+_recjson() {  # $1 key  $2 record-file  $3 kind
+  local key=$1 recf=$2 kind=$3 new=1
+  if [ "$key" = "$_key" ]; then printf "," >> "$EXECS_OUT"; new=0
+  elif [ -n "$_key" ]; then printf "]," >> "$EXECS_OUT"; fi
+  _key=$key; _todo=${_todo#* }
+  python3 - "$key" "$recf" "$kind" "$new" >> "$EXECS_OUT" <<'PYRECJSON'
+import json, sys
+key, recf, kind, new = sys.argv[1:5]
+try:
+    rec = json.load(open(recf))
+    if not isinstance(rec, dict):
+        raise ValueError(rec)
+except Exception:
+    rec = {'kind': kind, 'cmd': '', 'status': 'fail', 'output': '',
+           'note': 'not run: the ui_test runner stopped before it wrote a record'}
+sys.stdout.write((json.dumps(key) + ':[' if new == '1' else '') + json.dumps(rec))
+PYRECJSON
+}
+"""
+
+# One ui_test step, run the way handle_ui_test runs it. Standalone, like the script.
+_UI_RUNNER = r'''
+"""One ui_test step, run as doctest run runs it: setup, launch the app headless, wait for
+its inspector, drive it with node, record each action, tear the app's process tree down.
+Written by `doctest emit-smoke`. argv: bash, record path. stdin: the step's config."""
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+BASH, RECORD = sys.argv[1:3]
+CFG = json.load(sys.stdin)
+WINDOWS = os.name == "nt"
+PORT = int(CFG["port"])
+DRIVER, TRACE, APP_LOG = "ui-test.mjs", "ui-test.actions.json", "ui-test-app.log"
+RUNNER_CMD = 'node "%s" --verbose' % DRIVER
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+if WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+
+    class _BasicLimits(ctypes.Structure):  # JOBOBJECT_BASIC_LIMIT_INFORMATION
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64), ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD), ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+    class _Limits(ctypes.Structure):  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        _fields_ = [("BasicLimitInformation", _BasicLimits), ("IoInfo", ctypes.c_uint64 * 6),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    KERNEL32.CreateJobObjectW.restype = wintypes.HANDLE
+    KERNEL32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    KERNEL32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                 wintypes.DWORD]
+    KERNEL32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    KERNEL32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    NTDLL = ctypes.WinDLL("ntdll")
+    NTDLL.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    NTDLL.NtResumeProcess.restype = ctypes.c_long
+
+
+def contain(app):
+    """Windows: the suspended launch joins a kill-on-close job, then runs. MSYS exec leaves
+    dead parents in the process tree, so `taskkill /T` alone missed the app (env.exe)."""
+    job = KERNEL32.CreateJobObjectW(None, None)
+    limits = _Limits()
+    limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    held = bool(job and KERNEL32.SetInformationJobObject(job, 9, ctypes.byref(limits),
+                                                         ctypes.sizeof(limits))
+                and KERNEL32.AssignProcessToJobObject(job, int(app._handle)))
+    if NTDLL.NtResumeProcess(int(app._handle)) != 0:
+        raise OSError("could not resume the launched app")
+    if not held:
+        say("::warning::the app is not held in a job (error %d); teardown falls back to "
+            "taskkill /T" % ctypes.get_last_error())
+        return None
+    return job
+
+
+def say(text):
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    sys.stdout.flush()
+
+
+def bash_file(name, command):
+    """The command as a script file: an argv handed to MSYS bash is re-quoted and globbed."""
+    with open(name, "w", newline="\n") as f:
+        f.write(command + "\n")
+    return [BASH, name]
+
+
+def port_open():
+    # 1 s: Windows retries a refused loopback connect for ~2 s, per address.
+    try:
+        with socket.create_connection(("localhost", PORT), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def tail(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().strip()[-1500:]
+    except OSError:
+        return ""
+
+
+def actions():
+    """Each action joined to the driver's journal, as doctest's _ui_action_results does."""
+    trace, error = [], ""
+    try:
+        with open(TRACE) as f:
+            trace = json.load(f)
+        if not isinstance(trace, list) or len(trace) > len(CFG["descriptions"]):
+            raise ValueError("invalid action journal length")
+        for i, entry in enumerate(trace):
+            if (not isinstance(entry, dict) or entry.get("index") != i
+                    or entry.get("status") not in ("pass", "fail", "running")
+                    or (i < len(trace) - 1 and entry["status"] != "pass")):
+                raise ValueError("invalid action journal sequence")
+    except (OSError, ValueError) as exc:
+        trace, error = [], "UI action evidence unavailable: %s" % exc
+    found = []
+    for i, description in enumerate(CFG["descriptions"]):
+        entry = trace[i] if i < len(trace) else {}
+        action = {"index": i + 1, "description": description,
+                  "status": entry.get("status", "not_run")}
+        for key in ("duration_ms", "error"):
+            if key in entry:
+                action[key] = entry[key]
+        found.append(action)
+    return found, error
+
+
+def stop(app, job):
+    """Ends the app's whole process tree: its children (ui-host, module hosts) outlive it."""
+    if job:
+        KERNEL32.TerminateJobObject(job, 1)
+    elif WINDOWS:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(app.pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        try:
+            os.killpg(app.pid, signal.SIGTERM)
+        except OSError:
+            pass
+    try:
+        app.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    if WINDOWS:
+        return
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            os.killpg(app.pid, 0)
+        except OSError:
+            return
+        time.sleep(0.2)
+    try:
+        os.killpg(app.pid, signal.SIGKILL)
+        app.wait(timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def released():
+    deadline = time.time() + 10
+    while port_open():
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+    return True
+
+
+def drive(app, node):
+    timeout = CFG["launch_timeout"]
+    say("  Waiting for inspector on port %d (timeout %ss)..." % (PORT, timeout))
+    deadline = time.time() + float(timeout)
+    while True:
+        if app.poll() is not None:
+            return ("fail", "app exited (code %s) before inspector opened on port %d"
+                    % (app.returncode, PORT), tail(APP_LOG), "")
+        if port_open():
+            break
+        if time.time() >= deadline:
+            return ("fail", "inspector not available on port %d after %ss" % (PORT, timeout),
+                    tail(APP_LOG), "")
+        time.sleep(0.5)
+    say("  Running UI tests (%d actions)..." % len(CFG["descriptions"]))
+    os.makedirs(CFG["images"], exist_ok=True)
+    try:
+        proc = subprocess.run([node, DRIVER, "--verbose"], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=120)
+        rc, output = proc.returncode, proc.stdout.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired as exc:
+        rc, output = 124, (exc.stdout or b"").decode("utf-8", "replace") + "\ncommand timed out"
+    say(output)
+    found, error = actions()
+    if rc == 0 and found and all(a["status"] == "pass" for a in found):
+        return "pass", "", output, RUNNER_CMD
+    note = error or "UI tests failed or did not complete all actions"
+    return "fail", note, output + "\n\n--- app log ---\n" + tail(APP_LOG), RUNNER_CMD
+
+
+def run():
+    if CFG["refuse"]:
+        return "fail", CFG["refuse"], "", ""
+    for command in CFG["setup"]:
+        say("  Setup: " + command)
+        proc = subprocess.run(bash_file("ui-test-setup.sh", command),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        output = proc.stdout.decode("utf-8", "replace")
+        say(output)
+        if proc.returncode != 0:
+            return "fail", "setup command failed: " + command, output, ""
+    qt_mcp = CFG["qt_mcp"]
+    if not os.path.isdir(qt_mcp):
+        return "fail", "logos-qt-mcp not found: " + qt_mcp, "", ""
+    if not os.path.isfile(os.path.join(qt_mcp, "test-framework", "framework.mjs")):
+        return "fail", "logos-qt-mcp has no test-framework/framework.mjs: " + qt_mcp, "", ""
+    node = shutil.which("node")
+    if not node:
+        return "fail", "node not found: a ui_test drives the app with Node.js", "", ""
+    # Beyond doctest run: the driver would otherwise drive whatever already listens there.
+    if port_open():
+        return ("fail", "port %d was in use before launch: the driver would talk to "
+                "whatever holds it" % PORT, "", "")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_FORCE_STDERR_LOGGING="1",
+               QT_LOGGING_RULES="qt.*.debug=false;default.debug=true")
+    # Suspended on Windows (0x4, CREATE_SUSPENDED) until contain() has it in a job.
+    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | 0x4} if WINDOWS
+             else {"start_new_session": True})
+    say("  Launching: " + CFG["launch"])
+    with open(APP_LOG, "wb") as log:
+        app = subprocess.Popen(bash_file("ui-test-launch.sh", CFG["launch"]),
+                               stdin=subprocess.DEVNULL, stdout=log,
+                               stderr=subprocess.STDOUT, env=env, **group)
+        job = None
+        try:
+            if WINDOWS:
+                job = contain(app)
+            result = drive(app, node)
+        finally:
+            stop(app, job)
+    if not released():
+        status, note, output, runner = result
+        leftover = "teardown: port %d was still in use after the app was stopped" % PORT
+        say("::warning::" + leftover)
+        result = (status, note or leftover, output + "\n[" + leftover + "]", runner)
+    return result
+
+
+def main():
+    if os.path.exists(TRACE):
+        os.remove(TRACE)  # never accept an earlier step's evidence
+    status, note, output, runner = run()
+    found, _ = actions()
+    with open(RECORD, "w") as f:
+        json.dump({"kind": "ui_test", "cmd": CFG["cmd"], "status": status, "output": output,
+                   "note": note, "actions": found, "runner_cmd": runner}, f)
+    if status != "pass":
+        say("::error::%s %s: %s" % (CFG["key"], CFG["label"], note))
+    return 0 if status == "pass" else 1
+
+
+if not WINDOWS:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # still tear the app down
+sys.exit(main())
+'''
+
+
 def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
     """Bash that runs `keys` and writes a positional exec-record JSON.
-    A ui_test it cannot run is recorded as failed."""
+    A ui_test runs through ui-test-run.py; one it cannot run is recorded as failed."""
     steps = dict(iter_spec_steps(spec))
     warnings = []
     out = []
@@ -3707,15 +4050,26 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
         w('  exit "$rc"')
         w(")")
         w("")
+    if any(_ui_test_of(steps[key]) is not None for key in keys):
+        w("# ui_test: ui-test-run.py, written here, runs one step the way doctest run does;")
+        w("# _recjson appends the record it wrote.")
+        w(_RECJSON.strip("\n"))
+        w("cat > ui-test-run.py <<'DOCTEST_UI_RUN_EOF'")
+        w(_UI_RUNNER.strip("\n"))
+        w("DOCTEST_UI_RUN_EOF")
+        w("# The runner starts commands with this bash; a native Windows python3 needs its Windows path.")
+        w("_uibash=$BASH")
+        w('if command -v cygpath >/dev/null 2>&1; then _uibash=$(cygpath -w "$BASH"); fi')
+        w("")
     w("rc_all=0")
 
     todo = []
 
-    def rec(key, cmd, kind, status='"$([ "$_rc" -eq 0 ] && echo pass || echo fail)" "$_rc"'):
-        """The `_rec` line that closes one command, which `_fin` fails if it never runs.
-        `status` is _rec's status and exit-code arguments; by default both come from $_rc."""
+    def rec(key, cmd, kind):
+        """The `_rec` line that closes one command, which `_fin` fails if it never runs."""
         todo.append(f"{key}:{kind}")
-        w(f'_rec {shlex.quote(key)} {shlex.quote(cmd)} {status} "$_o" {kind}')
+        w(f'_rec {shlex.quote(key)} {shlex.quote(cmd)} '
+          f'"$([ "$_rc" -eq 0 ] && echo pass || echo fail)" "$_rc" "$_o" {kind}')
 
     for key in keys:
         step = steps[key]
@@ -3796,25 +4150,33 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
             w('rm -f "$_o"')
             w('[ "$_rc" -eq 0 ] || rc_all=$_rc')
 
-        # A ui_test this script cannot run is a failure, not a gap: dropping it let a leg
-        # pass a UI test that never ran. doctest run reaches one only without file/run.
-        ui = step.get("ui_test") or {}
-        if ui.get("tests") and not step.get("file") and not step.get("run"):
-            cmd = (ui.get("launch") or ui.get("binary") or "").replace("{ext}", ext).replace("{exe}", exe)
-            msg = (f"not run: a generated script cannot run a ui_test yet. If it is not meant "
-                   f"to run on {platform_label}, mark the step or its section with the "
-                   f"platforms it runs on.")
-            warnings.append(
-                f"step {key} ({title!r}) is a ui_test, which a generated script cannot "
-                f"run yet: the script records it as failed on {platform_label}.")
+        # A ui_test runs through ui-test-run.py. One it cannot run is still recorded, as
+        # failed: dropping it let a leg pass a UI test that never ran.
+        ui = _ui_test_of(step)
+        if ui is not None:
+            driver, cfg = _ui_test_plan(spec, step, ui, ext, exe)
             label = _header(title or "ui_test")
+            cfg.update(key=key, label=label)
+            if cfg["refuse"]:
+                warnings.append(
+                    f"step {key} ({title!r}) is a ui_test the script cannot run "
+                    f"({cfg['refuse'][len('not run: '):]}): it is recorded as failed "
+                    f"on {platform_label}.")
             w("")
-            w(f"# --- {key}  {label}  (ui_test: not run)")
-            w(f'_o=$(mktemp); printf "%s\\n" {shlex.quote(msg)} > "$_o"')
-            w(f"echo {shlex.quote(f'::error::{key} {label}: {msg}')}")
-            rec(key, cmd, "ui_test", status="fail ''")
-            w('rm -f "$_o"')
-            w("rc_all=1")
+            w(f"# --- {key}  {label}  (ui_test)")
+            if driver is not None:
+                w("cat > ui-test.mjs <<'DOCTEST_UI_MJS_EOF'")
+                w(driver.rstrip("\n"))
+                w("DOCTEST_UI_MJS_EOF")
+            w("_j=$(mktemp)")
+            w('python3 ui-test-run.py "$_uibash" "$_j" <<\'DOCTEST_UI_STEP_EOF\'')
+            w(json.dumps(cfg))
+            w("DOCTEST_UI_STEP_EOF")
+            w("_rc=$?")
+            todo.append(f"{key}:ui_test")
+            w(f'_recjson {shlex.quote(key)} "$_j" ui_test')
+            w('rm -f "$_j"')
+            w('[ "$_rc" -eq 0 ] || rc_all=$_rc')
 
         # `check_file:` asserts a glob matched something.
         pattern = step.get("check_file", "")

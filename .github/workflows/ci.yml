@@ -52,16 +52,17 @@ jobs:
       - name: Unit-test flag injection around a `--`
         run: nix develop .# --command python3 tests/test_inject_double_dash.py
 
+      # Before the emit-smoke tests: a generated ui_test runs its driver with Node.
+      - name: Setup Node for UI execution regression tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       # A generated Windows script ran a multi-line step twice (its header
       # comment covered one line) and a step's `set -e` killed the rest. A
       # step's passing last record also hid its earlier failure from `assemble`.
       - name: Unit-test emit-smoke step isolation and records
         run: nix develop .# --command python3 tests/test_emit_smoke.py
-
-      - name: Setup Node for UI execution regression tests
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
 
       - name: Verify UI actions execute and failures cannot pass
         run: nix develop .# --command python3 tests/test_ui_execution.py
@@ -150,15 +151,27 @@ jobs:
       - name: Install PyYAML
         run: python -m pip install pyyaml
 
+      # A generated ui_test runs its driver with Node.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       # The tests run `bash` from PATH; the scripts write their records with `python3`.
-      - name: Show the bash and python3 the scripts get
+      - name: Show the bash, python3 and node the scripts get
         run: |
           python -c 'import shutil; print("bash:", shutil.which("bash"))'
           bash --version | head -1
           command -v python3 && python3 --version
+          command -v node && node --version
 
       - name: Unit-test emit-smoke under Git Bash
         run: python tests/test_emit_smoke.py
+
+      # The generated driver imports qt-mcp's framework by absolute path, which Node on
+      # Windows accepts only as a file:// URL.
+      - name: Verify UI drivers execute under Node on Windows
+        run: python tests/test_ui_execution.py
 
   publish-report:
     name: Publish reports to GitHub Pages
