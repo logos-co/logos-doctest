@@ -3722,16 +3722,17 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
             # A subshell, as doctest runs each step in its own shell: a step's
             # `set -e`, `cd` or `exit` must not reach the steps after it.
             w("(")
-            for line in cmd.rstrip("\n").split("\n"):
-                w("  " + line)
+            # Unindented: an indent breaks heredoc terminators and multi-line strings.
+            w(cmd.rstrip("\n"))
             w(') >"$_o" 2>&1; _rc=$?')
             w('cat "$_o"')
             if expects:
                 w('if [ "$_rc" -eq 0 ]; then')
                 for e in expects:
-                    w(f'  grep -qF -- {shlex.quote(e.replace("{ext}", ext).replace("{exe}", exe))} "$_o" '
-                      f'|| {{ echo "::error::expected output not found: '
-                      f'{e.replace("{ext}", ext).replace("{exe}", exe)}"; _rc=90; }}')
+                    want = e.replace("{ext}", ext).replace("{exe}", exe)
+                    # Quoted whole: a `"` or `$` in an expect is data, not shell.
+                    msg = shlex.quote("::error::expected output not found: " + want)
+                    w(f'  grep -qF -- {shlex.quote(want)} "$_o" || {{ echo {msg}; _rc=90; }}')
                 w("fi")
             w(f'_rec {shlex.quote(key)} {shlex.quote(cmd)} '
               f'"$([ "$_rc" -eq 0 ] && echo pass || echo fail)" "$_rc" "$_o" run')
@@ -3746,7 +3747,7 @@ def emit_smoke_script(spec, spec_path, ext, platform_label, keys, exe=""):
             w(f"# --- {key}  check_file: {_header(pattern)}")
             w('_o=$(mktemp)')
             w(f'if compgen -G {shlex.quote(pattern)} > "$_o"; then _rc=0; else '
-              f'_rc=1; echo "no match: {pattern}" > "$_o"; fi')
+              f'_rc=1; echo {shlex.quote("no match: " + pattern)} > "$_o"; fi')
             w('cat "$_o"')
             w(f'_rec {shlex.quote(key)} {shlex.quote("check file: " + pattern)} '
               f'"$([ "$_rc" -eq 0 ] && echo pass || echo fail)" "$_rc" "$_o" check_file')
