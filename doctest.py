@@ -3730,6 +3730,53 @@ RUNNER_CMD = 'node "%s" --verbose' % DRIVER
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+if WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+
+    class _BasicLimits(ctypes.Structure):  # JOBOBJECT_BASIC_LIMIT_INFORMATION
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64), ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD), ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+    class _Limits(ctypes.Structure):  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        _fields_ = [("BasicLimitInformation", _BasicLimits), ("IoInfo", ctypes.c_uint64 * 6),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    KERNEL32.CreateJobObjectW.restype = wintypes.HANDLE
+    KERNEL32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    KERNEL32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                 wintypes.DWORD]
+    KERNEL32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    KERNEL32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    NTDLL = ctypes.WinDLL("ntdll")
+    NTDLL.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    NTDLL.NtResumeProcess.restype = ctypes.c_long
+
+
+def contain(app):
+    """Windows: the suspended launch joins a kill-on-close job, then runs. MSYS exec leaves
+    dead parents in the process tree, so `taskkill /T` alone missed the app (env.exe)."""
+    job = KERNEL32.CreateJobObjectW(None, None)
+    limits = _Limits()
+    limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    held = bool(job and KERNEL32.SetInformationJobObject(job, 9, ctypes.byref(limits),
+                                                         ctypes.sizeof(limits))
+                and KERNEL32.AssignProcessToJobObject(job, int(app._handle)))
+    if NTDLL.NtResumeProcess(int(app._handle)) != 0:
+        raise OSError("could not resume the launched app")
+    if not held:
+        say("::warning::the app is not held in a job (error %d); teardown falls back to "
+            "taskkill /T" % ctypes.get_last_error())
+        return None
+    return job
+
 
 def say(text):
     sys.stdout.write(text if text.endswith("\n") else text + "\n")
@@ -3787,9 +3834,11 @@ def actions():
     return found, error
 
 
-def stop(app):
+def stop(app, job):
     """Ends the app's whole process tree: its children (ui-host, module hosts) outlive it."""
-    if WINDOWS:
+    if job:
+        KERNEL32.TerminateJobObject(job, 1)
+    elif WINDOWS:
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(app.pid)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
@@ -3881,21 +3930,26 @@ def run():
                 "whatever holds it" % PORT, "", "")
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_FORCE_STDERR_LOGGING="1",
                QT_LOGGING_RULES="qt.*.debug=false;default.debug=true")
-    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WINDOWS
+    # Suspended on Windows (0x4, CREATE_SUSPENDED) until contain() has it in a job.
+    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | 0x4} if WINDOWS
              else {"start_new_session": True})
     say("  Launching: " + CFG["launch"])
     with open(APP_LOG, "wb") as log:
         app = subprocess.Popen(bash_file("ui-test-launch.sh", CFG["launch"]),
                                stdin=subprocess.DEVNULL, stdout=log,
                                stderr=subprocess.STDOUT, env=env, **group)
+        job = None
         try:
+            if WINDOWS:
+                job = contain(app)
             result = drive(app, node)
         finally:
-            stop(app)
+            stop(app, job)
     if not released():
         status, note, output, runner = result
-        result = (status, note, output + "\n[teardown] port %d was still in use after the "
-                  "app was stopped" % PORT, runner)
+        leftover = "teardown: port %d was still in use after the app was stopped" % PORT
+        say("::warning::" + leftover)
+        result = (status, note or leftover, output + "\n[" + leftover + "]", runner)
     return result
 
 
