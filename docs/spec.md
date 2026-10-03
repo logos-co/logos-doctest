@@ -195,7 +195,7 @@ Two modes:
 | `binary` | string | Path to the app binary or `nix-app` to auto-resolve from flake (binary mode only). |
 | `qt_mcp` | string | Path to the logos-qt-mcp package, relative to workdir (e.g., `result-mcp`). Falls back to `--qt-mcp` CLI flag or `LOGOS_QT_MCP` env var. |
 | `setup` | list of strings | Commands to run before testing (e.g., `nix build 'github:logos-co/logos-qt-mcp' -o result-mcp`). |
-| `inspector_port` | integer | TCP port for the QML inspector (default: 3768). |
+| `inspector_port` | integer | TCP port for the QML inspector (default: 3768). `doctest run` falls back to `QML_INSPECTOR_PORT` from its environment first, and passes the port to the app and the driver as `QML_INSPECTOR_PORT`, so a `launch` that sets that variable itself must use the same port. |
 | `build_timeout` | integer | Seconds allowed for the pre-build of the launch command (default: 1800). |
 | `launch_timeout` | integer | Seconds to wait for the QML inspector after launching (default: 120). Boot time only — the app is pre-built first, see below. |
 | `tests` | list of objects | Test actions to execute. See below. |
@@ -258,6 +258,16 @@ renders the screenshots even when served from GitHub Pages (where only the
 report falls back to the relative `images/<file>.png` link.
 
 **Runner behavior (launch mode):** Runs setup commands, **pre-builds the app**, launches it in the background with `QT_QPA_PLATFORM=offscreen`, waits for the QML inspector to be available, generates a `.mjs` test file, runs it, then kills the app. Reports pass/fail.
+
+**Inspector port:** the driver talks to whatever answers on the inspector
+port, so `doctest run` makes sure that is the app it launched. It does not
+launch while something already listens there, and fails the step instead.
+Once the port opens, it reads the app's log: when qt-mcp's inspector logged
+that it could not listen on the port (and not that it listens there), the step
+fails without driving. A log that says neither is driven as before. When the
+tests end, the app's process group gets SIGTERM, then SIGKILL after 10 s, and
+the runner warns if the port is still held, since the next `ui_test` would
+not launch.
 
 **Pre-build:** a `launch` that starts with `nix run` is built before the
 inspector clock starts, under `build_timeout` rather than `launch_timeout`, so
