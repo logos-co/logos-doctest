@@ -1635,11 +1635,19 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 prop = t.get("find_by", "objectName")
                 val = t.get("find_value", "")
                 method = t.get("method", "")
-                args = _json.dumps(t.get("args", []))
+                arg_list = t.get("args", [])
+                args = _json.dumps(arg_list)
                 f.write(f'  {{\n')
                 f.write(f'    const found = await app.inspector.send("findByProperty", {{ property: "{prop}", value: "{val}" }});\n')
                 f.write(f'    if (!found.matches || found.matches.length === 0) throw new Error("call_method: element not found");\n')
-                f.write(f'    const res = await app.inspector.send("callMethod", {{ objectId: found.matches[0].id, method: "{method}", args: {args} }});\n')
+                f.write(f'    let res = await app.inspector.send("callMethod", {{ objectId: found.matches[0].id, method: "{method}", args: {args} }});\n')
+                if arg_list and re.fullmatch(r"[A-Za-z_]\w*", method):
+                    # callMethod passes each argument as a QVariant, which a typed
+                    # parameter (a QML signal's string, int) refuses. As an
+                    # expression, QML converts them; calling a signal emits it.
+                    expr = _json.dumps(f'{method}({", ".join(_json.dumps(a) for a in arg_list)})')
+                    f.write('    if (res.error && res.error.includes("Failed to invoke"))\n')
+                    f.write(f'      res = await app.inspector.send("evaluate", {{ objectId: found.matches[0].id, expression: {expr} }});\n')
                 f.write(f'    if (res.error) throw new Error("call_method {method}: " + res.error);\n')
                 f.write(f'  }}\n')
             elif action == "click_object":

@@ -65,6 +65,9 @@ export async function run() {
         state[args.property] = args.value;
       }
       if (command === 'click' && process.env.RPC_ERROR) return { error: 'click rejected' };
+      // TYPED_PARAMS: callMethod refuses arguments as Qt does for a typed parameter.
+      if (command === 'callMethod' && process.env.TYPED_PARAMS) return { error: "Failed to invoke '" + args.method + "'" };
+      if (command === 'evaluate' && process.env.EVAL_ERROR) return { error: 'Evaluation error: ReferenceError' };
       return {};
     }}
   };
@@ -230,6 +233,31 @@ class UIExecution(unittest.TestCase):
                 self.assertFalse(passed)
                 self.assertEqual(actions[0]['status'], 'fail')
                 self.assertIn('rejected', actions[0]['error'])
+
+    def test_call_method_with_typed_parameters_emits_through_evaluate(self):
+        tests = [{'action': 'call_method', 'find_value': 'view', 'method': 'unloadRequested',
+                  'args': ['package_downloader', 2]}]
+        _, passed, note, _ = self.execute(tests, TYPED_PARAMS='1')
+        self.assertTrue(passed, note)
+        calls = self.calls_made()
+        self.assertEqual([c[0] for c in calls], ['findByProperty', 'callMethod', 'evaluate'])
+        self.assertEqual(calls[2][1], {'objectId': 1,
+                                       'expression': 'unloadRequested("package_downloader", 2)'})
+
+    def test_call_method_fails_when_evaluate_fails_too(self):
+        tests = [{'action': 'call_method', 'find_value': 'view', 'method': 'unloadRequested',
+                  'args': ['x']}]
+        _, passed, _, actions = self.execute(tests, TYPED_PARAMS='1', EVAL_ERROR='1')
+        self.assertFalse(passed)
+        self.assertIn('call_method unloadRequested: Evaluation error', actions[0]['error'])
+
+    def test_call_method_without_arguments_does_not_fall_back(self):
+        tests = [{'action': 'call_method', 'find_value': 'view', 'method': 'openDetails',
+                  'args': []}]
+        _, passed, _, actions = self.execute(tests, TYPED_PARAMS='1')
+        self.assertFalse(passed)
+        self.assertIn("Failed to invoke 'openDetails'", actions[0]['error'])
+        self.assertNotIn('evaluate', [c[0] for c in self.calls_made()])
 
     def test_zero_exit_mid_action_does_not_pass(self):
         proc, passed, _, actions = self.execute([
