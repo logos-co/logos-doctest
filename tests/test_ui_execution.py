@@ -2,10 +2,15 @@
 """Execute generated drivers with Node; verify runtime evidence and failure gates."""
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shlex
 import shutil
+import socket
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -284,6 +289,161 @@ class UIExecution(unittest.TestCase):
         self.assertEqual(rec['runner_cmd'], 'node test.mjs --verbose')
         self.assertEqual(rec['actions'][0]['status'], 'pass')
         self.assertNotIn('# test actions:', rec['cmd'])
+
+
+PORT_FRAMEWORK = '''
+import { appendFileSync } from 'node:fs';
+let callback;
+export function test(name, fn) { callback = fn; }
+export async function run() {
+  appendFileSync(process.env.CALLS, JSON.stringify(['port', process.env.QML_INSPECTOR_PORT]) + '\\n');
+  try { await callback({}); }
+  catch (error) { console.error(error.message); process.exitCode = 1; }
+}
+'''
+
+# Listens on QML_INSPECTOR_PORT and logs what qt-mcp's inspector would.
+FAKE_APP = r'''
+import os, signal, socket, sys, time
+mode = sys.argv[1]
+port = int(os.environ["QML_INSPECTOR_PORT"])
+with open("app.pid", "w") as f:
+    f.write(str(os.getpid()))
+if mode == "stubborn":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+server = socket.socket()
+server.bind(("127.0.0.1", port))
+server.listen()
+listening = "[QmlInspector] Inspector server listening on port %d"
+failed = "[QmlInspector] Failed to listen on port %d : The bound address is already in use"
+for line in {"listening": [listening % port], "stubborn": [listening % port],
+             "taken": [failed % port], "child-failed": [failed % port, listening % port],
+             "other-port": [listening % (port + 1)], "silent": []}[mode]:
+    print(line, flush=True)
+while True:
+    time.sleep(1)
+'''
+
+
+def _free_port():
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        return probe.getsockname()[1]
+
+
+class InspectorPortChoice(unittest.TestCase):
+    def test_the_spec_wins_then_the_environment_then_3768(self):
+        with mock.patch.dict(os.environ, {'QML_INSPECTOR_PORT': '4001'}):
+            self.assertEqual(dt._inspector_port({'inspector_port': 4000}), 4000)
+            self.assertEqual(dt._inspector_port({}), 4001)
+        with mock.patch.dict(os.environ, {'QML_INSPECTOR_PORT': 'x'}):
+            self.assertEqual(dt._inspector_port({}), 3768)
+        with mock.patch.dict(os.environ):
+            os.environ.pop('QML_INSPECTOR_PORT', None)
+            self.assertEqual(dt._inspector_port({}), 3768)
+
+
+class InspectorPortGuard(unittest.TestCase):
+    """doctest run launches onto a free inspector port, and drives only an app listening there."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / 'test-framework').mkdir()
+        (self.root / 'test-framework' / 'framework.mjs').write_text(PORT_FRAMEWORK)
+        (self.root / 'fake_app.py').write_text(FAKE_APP)
+        self.calls = self.root / 'calls.jsonl'
+        self.port = _free_port()
+        for name in ('_INSPECTOR_LOG_GRACE', '_APP_STOP_GRACE'):
+            patcher = mock.patch.object(dt, name, 0.5)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_step(self, mode):
+        step = {'title': 'Drive the fake app', 'ui_test': {
+            'launch': f'{shlex.quote(sys.executable)} fake_app.py {mode}',
+            'qt_mcp': str(self.root), 'inspector_port': self.port, 'launch_timeout': 10,
+            'tests': [{'action': 'sleep', 'ms': 1}]}}
+        results = dt.Results(fail_fast=False)
+        collector = dt.ReportCollector()
+        with mock.patch.object(dt, '_REPORT', collector), \
+                mock.patch.dict(os.environ, {'CALLS': str(self.calls)}):
+            dt.handle_ui_test(step, str(self.root), results, False, [], '', {})
+        return results, collector.execs_for(step)[0]
+
+    def driven_on(self):
+        if not self.calls.exists():
+            return None
+        return [json.loads(line) for line in self.calls.read_text().splitlines()]
+
+    def assert_app_gone(self):
+        pid = int((self.root / 'app.pid').read_text())
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail(f'app {pid} outlived its step')
+        self.assertFalse(dt._port_open(self.port))
+
+    def test_a_port_in_use_is_refused_before_launch(self):
+        with socket.socket() as holder:
+            holder.bind(('127.0.0.1', self.port))
+            holder.listen()
+            with mock.patch.object(dt.subprocess, 'Popen') as launch:
+                results, rec = self.run_step('listening')
+        launch.assert_not_called()
+        self.assertEqual(results.failed, 1)
+        self.assertEqual(rec['status'], 'fail')
+        self.assertIn(f'inspector port {self.port} was in use before launch', rec['note'])
+        self.assertEqual(rec['actions'][0]['status'], 'not_run')
+
+    @unittest.skipIf(os.name == 'nt', 'doctest run launches the app with setsid')
+    @unittest.skipUnless(shutil.which('node'), 'Node is required to execute generated UI drivers')
+    def test_the_app_and_the_driver_get_the_spec_port(self):
+        results, rec = self.run_step('listening')
+        self.assertEqual((rec['status'], rec['note']), ('pass', ''), rec['output'])
+        self.assertEqual(results.passed, 1)
+        self.assertEqual(self.driven_on(), [['port', str(self.port)]])
+        self.assert_app_gone()
+
+    @unittest.skipIf(os.name == 'nt', 'doctest run launches the app with setsid')
+    @unittest.skipUnless(shutil.which('node'), 'Node is required to execute generated UI drivers')
+    def test_an_app_that_could_not_listen_is_not_driven(self):
+        results, rec = self.run_step('taken')
+        self.assertEqual(results.failed, 1)
+        self.assertIn(f'could not listen on inspector port {self.port}', rec['note'])
+        self.assertIsNone(self.driven_on())
+        self.assertEqual(rec['actions'][0]['status'], 'not_run')
+        self.assert_app_gone()
+
+    @unittest.skipIf(os.name == 'nt', 'doctest run launches the app with setsid')
+    @unittest.skipUnless(shutil.which('node'), 'Node is required to execute generated UI drivers')
+    def test_a_listening_line_outweighs_a_failed_one(self):
+        # A second process of the app may fail to bind the port the first one holds.
+        _, rec = self.run_step('child-failed')
+        self.assertEqual((rec['status'], rec['note']), ('pass', ''), rec['output'])
+
+    @unittest.skipIf(os.name == 'nt', 'doctest run launches the app with setsid')
+    @unittest.skipUnless(shutil.which('node'), 'Node is required to execute generated UI drivers')
+    def test_no_line_about_the_port_is_driven_as_before(self):
+        for mode in ('silent', 'other-port'):
+            with self.subTest(mode=mode):
+                self.calls.unlink(missing_ok=True)
+                _, rec = self.run_step(mode)
+                self.assertEqual((rec['status'], rec['note']), ('pass', ''), rec['output'])
+                self.assert_app_gone()
+
+    @unittest.skipIf(os.name == 'nt', 'doctest run launches the app with setsid')
+    @unittest.skipUnless(shutil.which('node'), 'Node is required to execute generated UI drivers')
+    def test_an_app_that_ignores_sigterm_is_killed(self):
+        _, rec = self.run_step('stubborn')
+        self.assertEqual(rec['status'], 'pass', rec['output'])
+        self.assert_app_gone()
 
 
 if __name__ == '__main__':

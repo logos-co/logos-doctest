@@ -939,7 +939,7 @@ def _inject_into_block(block, override_flags, workdir):
 
 # ── Command Execution ─────────────────────────────────────────────────────────
 
-def run_cmd(cmd, workdir, verbose=False, capture=False, timeout=None):
+def run_cmd(cmd, workdir, verbose=False, capture=False, timeout=None, env=None):
     """Run a shell command. Returns (exit_code, stdout) if capture=True."""
     if verbose:
         print(f"        cmd: {dim(cmd)}")
@@ -958,6 +958,7 @@ def run_cmd(cmd, workdir, verbose=False, capture=False, timeout=None):
                 stderr=subprocess.STDOUT,
                 text=True,
                 timeout=timeout,
+                env=env,
             )
             return result.returncode, result.stdout or ""
         else:
@@ -966,6 +967,7 @@ def run_cmd(cmd, workdir, verbose=False, capture=False, timeout=None):
                 shell=True,
                 cwd=workdir,
                 timeout=timeout,
+                env=env,
             )
             return result.returncode, ""
     except subprocess.TimeoutExpired:
@@ -1694,6 +1696,91 @@ def _wait_for_inspector(host="localhost", port=3768, timeout=60, proc=None):
     return "timeout"
 
 
+def _inspector_port(ui_spec):
+    """The ui_test's inspector_port, else QML_INSPECTOR_PORT (what the app and the
+    driver read), else 3768."""
+    if ui_spec.get("inspector_port") is not None:
+        return int(ui_spec["inspector_port"])
+    env = os.environ.get("QML_INSPECTOR_PORT", "")
+    return int(env) if env.isdigit() else 3768
+
+
+def _port_open(port, host="localhost"):
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+# qt-mcp's inspector logs one of these when it starts.
+_INSPECTOR_LOG = re.compile(r"\[QmlInspector\] (Inspector server listening|Failed to listen) on port (\d+)")
+_INSPECTOR_LOG_GRACE = 5
+
+
+def _inspector_not_ours(log_path, port):
+    """Why whatever answered on `port` is not the launched app, from the app's log.
+
+    Empty once the log says the app listens there, and also when it says nothing
+    either way within the grace period (an app whose inspector does not log).
+    """
+    deadline = time.time() + _INSPECTOR_LOG_GRACE
+    while True:
+        failed = False
+        try:
+            with open(log_path, errors="replace") as f:
+                for m in _INSPECTOR_LOG.finditer(f.read()):
+                    if int(m.group(2)) != port:
+                        continue
+                    if m.group(1) == "Failed to listen":
+                        failed = True
+                    else:
+                        return ""
+        except OSError:
+            pass
+        if time.time() >= deadline:
+            return ("the app could not listen on inspector port %d: another process "
+                    "answers there" % port) if failed else ""
+        time.sleep(0.2)
+
+
+_APP_STOP_GRACE = 10
+
+
+def _stop_app_group(proc):
+    """SIGTERM the app's process group (setsid made it one) and SIGKILL what is
+    left of it after the grace: its module hosts and ui-hosts can outlive it."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=_APP_STOP_GRACE)
+    except subprocess.TimeoutExpired:
+        pass
+    deadline = time.time() + _APP_STOP_GRACE
+    while time.time() < deadline:
+        try:
+            os.killpg(proc.pid, 0)
+        except OSError:
+            return
+        time.sleep(0.2)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _port_released(port, timeout=10):
+    deadline = time.time() + timeout
+    while _port_open(port):
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+    return True
+
+
 def _kill_process_tree(pid):
     """Kill a process and its children."""
     try:
@@ -1791,11 +1878,14 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
         launch_cmd = expand_vars(launch_cmd)
         launch_cmd = inject_nix_overrides(launch_cmd, override_flags, workdir)
 
+        # The app's inspector and the driver both read QML_INSPECTOR_PORT.
+        port = _inspector_port(ui_spec)
         env = {
             **os.environ,
             "QT_QPA_PLATFORM": "offscreen",
             "QT_FORCE_STDERR_LOGGING": "1",
             "QT_LOGGING_RULES": "qt.*.debug=false;default.debug=true",
+            "QML_INSPECTOR_PORT": str(port),
         }
 
         # Pre-build the app before starting the inspector clock. `nix run .`
@@ -1829,6 +1919,14 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
             if wrc != 0:
                 print(f"        {yellow('pre-build returned non-zero; launching anyway')}")
 
+        # The app could not listen there, and the tests would drive whatever does.
+        if _port_open(port):
+            note = (f"inspector port {port} was in use before launch: the tests would "
+                    "drive whatever holds it")
+            _rec_ui(step, launch_cmd, tests, "fail", note, "")
+            results.fail(title, note)
+            return
+
         app_log_path = os.path.join(workdir, "ui-test-app.log")
         app_log = open(app_log_path, "w")
 
@@ -1859,7 +1957,6 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
                 return ""
 
         try:
-            port = ui_spec.get("inspector_port", 3768)
             timeout = ui_spec.get("launch_timeout", 120)
             print(f"  Waiting for inspector on port {port} (timeout {timeout}s)...")
             status = _wait_for_inspector(port=port, timeout=timeout, proc=app_proc)
@@ -1877,10 +1974,18 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
                 results.fail(title, f"inspector not available on port {port} after {timeout}s")
                 _dump_app_log("inspector port never opened (app still running — likely slow boot or wrong port)")
                 return
+            # Something else can take the port between the check above and the app's bind.
+            note = _inspector_not_ours(app_log_path, port)
+            if note:
+                _rec_ui(step, launch_cmd, tests, "fail", note, _app_log_tail())
+                results.fail(title, note)
+                _dump_app_log(note)
+                return
 
             print(f"  Running UI tests ({len(tests)} actions)...")
             cmd = f'node "{mjs_path}" --verbose'
-            rc, output = run_cmd(cmd, workdir, verbose, capture=True, timeout=120)
+            rc, output = run_cmd(cmd, workdir, verbose, capture=True, timeout=120,
+                                 env={**os.environ, "QML_INSPECTOR_PORT": str(port)})
             passed, note, actions = _ui_run_outcome(rc, tests, trace_path)
             if passed:
                 _rec_ui(step, launch_cmd, tests, "pass", "", output, actions, cmd)
@@ -1893,15 +1998,11 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
                 print(f"        {dim(trimmed)}")
                 _dump_app_log("app output during test run")
         finally:
-            try:
-                os.killpg(os.getpgid(app_proc.pid), signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-            try:
-                app_proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                pass
+            _stop_app_group(app_proc)
             app_log.close()
+            # The next ui_test refuses to launch while the port is held.
+            if not _port_released(port):
+                print(f"        {yellow(f'inspector port {port} was still in use after the app was stopped')}")
 
     else:
         # Binary mode: use --ci flag (test framework manages the app)
