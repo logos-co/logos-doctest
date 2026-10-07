@@ -141,6 +141,13 @@ class UIExecution(unittest.TestCase):
     def calls_made(self):
         return [json.loads(line) for line in self.calls.read_text().splitlines()]
 
+    def test_the_driver_cap_counts_the_wait_the_driver_applies(self):
+        tests = [{'action': 'wait_for', 'texts': ['Ready']}]
+        _, passed, note, _ = self.execute(tests)
+        self.assertTrue(passed, note)
+        waited = self.calls_made()[0][1]['timeout']
+        self.assertEqual(dt._ui_tests_timeout({'tests': tests}), 120 + waited / 1000)
+
     def test_expect_property_with_timeout_polls_until_it_holds(self):
         # The element is missing at first, then its value has not settled yet.
         tests = [{'action': 'expect_property', 'find_value': 'field', 'property': 'enabled',
@@ -371,6 +378,38 @@ class InspectorPortChoice(unittest.TestCase):
             self.assertEqual(dt._inspector_port({}), 3768)
 
 
+class DriverTimeout(unittest.TestCase):
+    """The driver may run 120 s plus every action's own wait, unless tests_timeout is set."""
+
+    # logos-monerod-ui's sync step: 1080 s of waits, cut short by the old flat 120 s.
+    SYNC = [{'action': 'wait_for', 'texts': ['stopped'], 'timeout': 30000},
+            {'action': 'click', 'target': 'Start'},
+            {'action': 'wait_for', 'texts': ['running'], 'timeout': 60000},
+            {'action': 'wait_for', 'texts': ['Syncing'], 'timeout': 900000},
+            {'action': 'expect_property', 'find_value': 'syncPercent', 'property': 'visible',
+             'value': True},
+            {'action': 'click', 'target': 'Stop'},
+            {'action': 'wait_for', 'texts': ['stopped'], 'timeout': 90000}]
+
+    def test_waits_beyond_120_s_extend_the_cap(self):
+        self.assertEqual(dt._ui_tests_timeout({'tests': self.SYNC}), 120 + 1080)
+
+    def test_actions_that_do_not_wait_keep_120_s(self):
+        self.assertEqual(dt._ui_tests_timeout({'tests': [
+            {'action': 'click', 'target': 'Go'},
+            {'action': 'expect_property', 'find_value': 'f', 'property': 'p', 'value': 1}]}), 120)
+
+    def test_default_waits_count_too(self):
+        # wait_for waits 10 s and sleep 1 s by default; expect_property polls only with a timeout.
+        self.assertEqual(dt._ui_tests_timeout({'tests': [
+            {'action': 'wait_for', 'texts': ['Ready']}, {'action': 'sleep'},
+            {'action': 'expect_property', 'find_value': 'f', 'property': 'p', 'value': 1,
+             'timeout': 2000}]}), 120 + 10 + 1 + 2)
+
+    def test_tests_timeout_overrides_the_sum(self):
+        self.assertEqual(dt._ui_tests_timeout({'tests_timeout': 30, 'tests': self.SYNC}), 30)
+
+
 class InspectorPortGuard(unittest.TestCase):
     """doctest run launches onto a free inspector port, and drives only an app listening there."""
 
@@ -388,11 +427,11 @@ class InspectorPortGuard(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def run_step(self, mode):
+    def run_step(self, mode, tests=None, **ui):
         step = {'title': 'Drive the fake app', 'ui_test': {
             'launch': f'{shlex.quote(sys.executable)} fake_app.py {mode}',
             'qt_mcp': str(self.root), 'inspector_port': self.port, 'launch_timeout': 10,
-            'tests': [{'action': 'sleep', 'ms': 1}]}}
+            'tests': tests or [{'action': 'sleep', 'ms': 1}], **ui}}
         results = dt.Results(fail_fast=False)
         collector = dt.ReportCollector()
         with mock.patch.object(dt, '_REPORT', collector), \
@@ -471,6 +510,29 @@ class InspectorPortGuard(unittest.TestCase):
     def test_an_app_that_ignores_sigterm_is_killed(self):
         _, rec = self.run_step('stubborn')
         self.assertEqual(rec['status'], 'pass', rec['output'])
+        self.assert_app_gone()
+
+    @unittest.skipIf(os.name == 'nt', 'doctest run launches the app with setsid')
+    @unittest.skipUnless(shutil.which('node'), 'Node is required to execute generated UI drivers')
+    def test_the_driver_may_run_as_long_as_its_actions_wait(self):
+        (self.root / 'test-framework' / 'framework.mjs').write_text(FRAMEWORK)
+        tests = [{'action': 'wait_for', 'texts': ['Ready'], 'timeout': 900000}]
+        with mock.patch.object(dt, 'run_cmd', wraps=dt.run_cmd) as run_cmd:
+            _, rec = self.run_step('listening', tests)
+        self.assertEqual((rec['status'], rec['note']), ('pass', ''), rec['output'])
+        self.assertEqual([c.kwargs['timeout'] for c in run_cmd.call_args_list
+                          if c.args[0].startswith('node ')], [120 + 900])
+
+    @unittest.skipIf(os.name == 'nt', 'doctest run launches the app with setsid')
+    @unittest.skipUnless(shutil.which('node'), 'Node is required to execute generated UI drivers')
+    def test_tests_timeout_stops_the_driver(self):
+        started = time.time()
+        results, rec = self.run_step('listening', [{'action': 'sleep', 'ms': 10000}],
+                                     tests_timeout=1)
+        self.assertLess(time.time() - started, 10)
+        self.assertEqual(results.failed, 1)
+        self.assertIn('command timed out after 1s', rec['output'])
+        self.assertEqual(rec['actions'][0]['status'], 'running')
         self.assert_app_gone()
 
 

@@ -736,6 +736,25 @@ class EmitSmokeUiTestRuns(unittest.TestCase):
         self.assertEqual(len(self.pids(work)), 2)
         self.assertEqual(self.alive_after_run(work), [])
 
+    def test_the_driver_may_run_as_long_as_its_actions_wait(self):
+        spec = _ui_spec(_free_port(), tests=[
+            {"name": "sync", "action": "wait_for", "texts": ["Ready"], "timeout": 900000}])
+        keys = [key for key, _ in ENGINE.iter_spec_steps(spec)]
+        script, _ = ENGINE.emit_smoke_script(spec, "ui.test.yaml", "so", "linux", keys)
+        lines = script.splitlines()
+        cfg = json.loads(lines[lines.index("DOCTEST_UI_STEP_EOF") - 1])
+        self.assertEqual(cfg["tests_timeout"], 120 + 900)
+
+    def test_tests_timeout_stops_the_driver(self):
+        started = time.time()
+        work, proc, rec = self.run_spec(_ui_spec(_free_port(), tests=[
+            {"name": "nap", "action": "sleep", "ms": 20000}], tests_timeout=2))
+        self.assertLess(time.time() - started, 20)
+        self.assertEqual((proc.returncode, rec["status"]), (1, "fail"))
+        self.assertIn("command timed out after 2s", rec["output"])
+        self.assertEqual(rec["actions"][0]["status"], "running")
+        self.assertEqual(self.alive_after_run(work), [])
+
     def test_failing_setup_stops_before_launch(self):
         work, proc, rec = self.run_spec(
             _ui_spec(_free_port(), setup=["echo preparing", "echo broken; exit 4"]))

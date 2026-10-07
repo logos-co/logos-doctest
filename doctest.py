@@ -52,6 +52,7 @@ import base64
 import collections
 import glob
 import json
+import math
 import os
 import platform
 import re
@@ -971,7 +972,7 @@ def run_cmd(cmd, workdir, verbose=False, capture=False, timeout=None, env=None):
             )
             return result.returncode, ""
     except subprocess.TimeoutExpired:
-        return 124, "command timed out"
+        return 124, f"command timed out after {timeout:g}s"
     except Exception as e:
         return 1, str(e)
 
@@ -1477,6 +1478,29 @@ def _ui_action_md_blocks(ui_test_spec, images_dir=None):
 # Actions that act on the UI, as opposed to waiting for or asserting on it.
 UI_CHANGING = {"click", "click_object", "set_text", "set_property", "call_method"}
 
+# What the generated driver waits when an action leaves it out (ms).
+_WAIT_FOR_DEFAULT_MS = 10000
+_SLEEP_DEFAULT_MS = 1000
+# The driver's old flat cap, now its allowance beyond the actions' own waits.
+_UI_TESTS_MARGIN = 120
+
+
+def _ui_tests_timeout(ui):
+    """Seconds the driver may run: `tests_timeout`, else 120 plus every action's own wait,
+    so no wait_for or expect_property `timeout` is cut short."""
+    if ui.get("tests_timeout") is not None:
+        return float(ui["tests_timeout"])
+    waits = 0.0
+    for t in ui.get("tests") or []:
+        value = {"wait_for": t.get("timeout", _WAIT_FOR_DEFAULT_MS),
+                 "expect_property": t.get("timeout"),
+                 "sleep": t.get("ms", _SLEEP_DEFAULT_MS)}.get(t.get("action"))
+        try:
+            waits += max(0.0, float(value))
+        except (TypeError, ValueError):
+            pass  # no wait, or not a number (the driver fails on that itself)
+    return _UI_TESTS_MARGIN + math.ceil(waits / 1000)
+
 
 def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=None,
                        trace_path=None):
@@ -1569,7 +1593,7 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 f.write(f'  await app.expectTexts({texts});\n')
             elif action == "wait_for":
                 texts = _json.dumps(t.get("texts", []))
-                timeout = t.get("timeout", 10000)
+                timeout = t.get("timeout", _WAIT_FOR_DEFAULT_MS)
                 name = t.get("name", "")
                 f.write(f'  await app.waitFor(\n')
                 f.write(f'    async () => {{ await app.expectTexts({texts}); }},\n')
@@ -1663,7 +1687,7 @@ def generate_mjs_tests(tests, qt_mcp_path, test_name, output_path, images_dir=No
                 f.write('    if (res.error) throw new Error("click_object: " + res.error);\n')
                 f.write(f'  }}\n')
             elif action == "sleep":
-                ms = t.get("ms", 1000)
+                ms = t.get("ms", _SLEEP_DEFAULT_MS)
                 f.write(f'  await new Promise(r => setTimeout(r, {ms}));\n')
 
             if action in UI_CHANGING:
@@ -1874,6 +1898,7 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
             os.path.join(workdir, "ui-test.mjs"),
             images_dir=images_dir, trace_path=trace_path,
         )
+        tests_timeout = _ui_tests_timeout(ui_spec)
     except ValueError as exc:
         _rec_ui(step, "", tests, "fail", str(exc), "")
         results.fail(title, str(exc))
@@ -1990,9 +2015,9 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
                 _dump_app_log(note)
                 return
 
-            print(f"  Running UI tests ({len(tests)} actions)...")
+            print(f"  Running UI tests ({len(tests)} actions, timeout {tests_timeout:g}s)...")
             cmd = f'node "{mjs_path}" --verbose'
-            rc, output = run_cmd(cmd, workdir, verbose, capture=True, timeout=120,
+            rc, output = run_cmd(cmd, workdir, verbose, capture=True, timeout=tests_timeout,
                                  env={**os.environ, "QML_INSPECTOR_PORT": str(port)})
             passed, note, actions = _ui_run_outcome(rc, tests, trace_path)
             if passed:
@@ -2052,8 +2077,8 @@ def handle_ui_test(step, workdir, results, verbose, override_flags, qt_mcp_cli, 
 
         env_prefix = "QT_QPA_PLATFORM=offscreen QT_FORCE_STDERR_LOGGING=1"
         cmd = f'{env_prefix} node "{mjs_path}" --ci "{binary_path}" --verbose'
-        print(f"  Running UI tests ({len(tests)} actions)...")
-        rc, output = run_cmd(cmd, workdir, verbose, capture=True, timeout=120)
+        print(f"  Running UI tests ({len(tests)} actions, timeout {tests_timeout:g}s)...")
+        rc, output = run_cmd(cmd, workdir, verbose, capture=True, timeout=tests_timeout)
         passed, note, actions = _ui_run_outcome(rc, tests, trace_path)
         if passed:
             _rec_ui(step, cmd, tests, "pass", "", output, actions)
@@ -3793,6 +3818,7 @@ def _ui_test_plan(spec, step, ui, ext, exe):
         "qt_mcp": ui.get("qt_mcp", "") or "",
         "port": int(ui.get("inspector_port", 3768)),
         "launch_timeout": ui.get("launch_timeout", 120),
+        "tests_timeout": _ui_tests_timeout(ui),
         "descriptions": [_describe_ui_actions([t])[2:] for t in tests],
         "images": "images",
         "refuse": "",
@@ -4026,14 +4052,16 @@ def drive(app, node):
             return ("fail", "inspector not available on port %d after %ss" % (PORT, timeout),
                     tail(APP_LOG), "")
         time.sleep(0.5)
-    say("  Running UI tests (%d actions)..." % len(CFG["descriptions"]))
+    limit = CFG["tests_timeout"]
+    say("  Running UI tests (%d actions, timeout %gs)..." % (len(CFG["descriptions"]), limit))
     os.makedirs(CFG["images"], exist_ok=True)
     try:
         proc = subprocess.run([node, DRIVER, "--verbose"], stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, timeout=120)
+                              stderr=subprocess.STDOUT, timeout=limit)
         rc, output = proc.returncode, proc.stdout.decode("utf-8", "replace")
     except subprocess.TimeoutExpired as exc:
-        rc, output = 124, (exc.stdout or b"").decode("utf-8", "replace") + "\ncommand timed out"
+        rc, output = 124, ((exc.stdout or b"").decode("utf-8", "replace")
+                           + "\ncommand timed out after %gs" % limit)
     say(output)
     found, error = actions()
     if rc == 0 and found and all(a["status"] == "pass" for a in found):
