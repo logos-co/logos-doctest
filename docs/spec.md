@@ -198,6 +198,7 @@ Two modes:
 | `inspector_port` | integer | TCP port for the QML inspector (default: 3768). `doctest run` falls back to `QML_INSPECTOR_PORT` from its environment first, and passes the port to the app and the driver as `QML_INSPECTOR_PORT`, so a `launch` that sets that variable itself must use the same port. |
 | `build_timeout` | integer | Seconds allowed for the pre-build of the launch command (default: 1800). |
 | `launch_timeout` | integer | Seconds to wait for the QML inspector after launching (default: 120). Boot time only — the app is pre-built first, see below. |
+| `tests_timeout` | number | Seconds the driver may take to run the whole `tests` list (default: 120 plus the actions' own waits — each `wait_for` and `expect_property` `timeout`, each `sleep` `ms` — so no action's `timeout` is cut short). |
 | `tests` | list of objects | Test actions to execute. See below. |
 
 **Test actions:**
